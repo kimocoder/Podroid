@@ -7,7 +7,7 @@
 # SECTION 0: Custom Kernel Build (aarch64) — Image + modules
 # ==============================================================================
 FROM debian:bookworm AS kernel-builder
-ARG KERNEL_VERSION=6.6.87
+ARG KERNEL_VERSION=7.0.5
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget ca-certificates xz-utils make gcc gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-RUN wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz \
+RUN wget -q https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-${KERNEL_VERSION}.tar.xz \
     && tar xf linux-${KERNEL_VERSION}.tar.xz \
     && rm linux-${KERNEL_VERSION}.tar.xz
 
@@ -38,7 +38,7 @@ RUN printf '%s\n' \
     'CONFIG_NETFILTER_ADVANCED=y' \
     'CONFIG_NETFILTER_NETLINK=y' \
     'CONFIG_NF_CONNTRACK=y' \
-    'CONFIG_NF_CONNTRACK_NETLINK=y' \
+    'CONFIG_NF_CT_NETLINK=y' \
     'CONFIG_NF_NAT=y' \
     'CONFIG_NF_TABLES=y' \
     'CONFIG_NF_TABLES_INET=y' \
@@ -59,6 +59,9 @@ RUN printf '%s\n' \
     'CONFIG_IP6_NF_NAT=y' \
     'CONFIG_IP6_NF_TARGET_MASQUERADE=y' \
     'CONFIG_NETFILTER_XTABLES=y' \
+    'CONFIG_NETFILTER_XTABLES_LEGACY=y' \
+    'CONFIG_IP_NF_IPTABLES_LEGACY=y' \
+    'CONFIG_IP6_NF_IPTABLES_LEGACY=y' \
     'CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y' \
     'CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y' \
     'CONFIG_NETFILTER_XT_MATCH_MARK=y' \
@@ -71,6 +74,8 @@ RUN printf '%s\n' \
     'CONFIG_EXT4_FS_SECURITY=y' \
     'CONFIG_SQUASHFS_XATTR=y' \
     'CONFIG_SQUASHFS_ZSTD=y' \
+    'CONFIG_DECOMPRESS_ZSTD=y' \
+    'CONFIG_ZSTD_DECOMPRESS=y' \
     'CONFIG_IKCONFIG=y' \
     'CONFIG_IKCONFIG_PROC=y' \
     'CONFIG_IP_NF_RAW=y' \
@@ -116,12 +121,15 @@ RUN cd linux-${KERNEL_VERSION} \
     && make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig \
     && echo "=== verifying critical options are =y ===" \
     && for opt in IPV6 BRIDGE BRIDGE_NETFILTER NF_TABLES_BRIDGE \
+                  NETFILTER_XTABLES_LEGACY \
+                  IP_NF_IPTABLES_LEGACY IP6_NF_IPTABLES_LEGACY \
                   IP6_NF_IPTABLES IP6_NF_FILTER IP6_NF_NAT \
                   IP_NF_TARGET_MASQUERADE IP6_NF_TARGET_MASQUERADE \
                   NETFILTER_XT_TARGET_MASQUERADE NF_NAT_MASQUERADE \
                   NFT_COMPAT NFT_MASQ NFT_NAT \
                   VETH TUN NF_TABLES NF_NAT NETFILTER OVERLAY_FS FUSE_FS \
                   EXT4_FS_SECURITY SQUASHFS_XATTR SQUASHFS_ZSTD \
+                  DECOMPRESS_ZSTD ZSTD_DECOMPRESS \
                   IKCONFIG IKCONFIG_PROC; do \
            grep -q "^CONFIG_${opt}=y\$" .config \
                || { echo "FATAL: CONFIG_${opt} is not =y after merge" >&2; \
@@ -186,7 +194,7 @@ RUN cd /rootfs && find . | cpio -o -H newc 2>/dev/null | gzip -9 > /output/initr
 # ==============================================================================
 
 FROM debian:bookworm AS qemu-builder
-ARG QEMU_VERSION=11.0.0-rc2
+ARG QEMU_VERSION=11.0.0
 ENV QEMU_DIR=qemu-${QEMU_VERSION}
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \

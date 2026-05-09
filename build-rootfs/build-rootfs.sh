@@ -21,6 +21,8 @@ apk -X "https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_BRANCH}/main" \
     busybox-openrc \
     bash \
     podman \
+    docker docker-openrc docker-cli-compose \
+    lxc lxc-templates lxc-openrc lxc-bridge \
     crun \
     fuse-overlayfs \
     iptables \
@@ -99,6 +101,13 @@ cp /work/files/etc/rc.conf "$ROOTFS/etc/rc.conf"
 mkdir -p "$ROOTFS/etc/profile.d"
 cp /work/files/etc/profile.d/*.sh "$ROOTFS/etc/profile.d/" 2>/dev/null || true
 chmod 0644 "$ROOTFS/etc/profile.d/"*.sh 2>/dev/null || true
+
+# /etc/containers/storage.conf — pin Podman to the in-kernel overlay driver.
+# Without this file, Podman auto-detects fuse-overlayfs (still apk-installed
+# as a fallback) and uses it, which is slower than native overlay.
+mkdir -p "$ROOTFS/etc/containers"
+cp /work/files/etc/containers/storage.conf "$ROOTFS/etc/containers/storage.conf"
+chmod 0644 "$ROOTFS/etc/containers/storage.conf"
 
 # Hostname (read by podroid-bootstrap via `hostname -F /etc/hostname`)
 echo "podroid" > "$ROOTFS/etc/hostname"

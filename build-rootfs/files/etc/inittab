@@ -2,5 +2,5 @@
 ::sysinit:/sbin/openrc boot
 ::wait:/sbin/openrc default
 
-hvc0::respawn:/sbin/getty -L -l /usr/local/bin/podroid-login hvc0 115200 xterm-256color
+hvc0::respawn:/sbin/getty -L -l /usr/local/bin/podroid-login 115200 hvc0 xterm-256color
 ::shutdown:/sbin/openrc shutdown

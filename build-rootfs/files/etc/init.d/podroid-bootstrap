@@ -42,12 +42,16 @@ start() {
 
     # Downloads share — self-gating: host only adds the virtio-9p device when
     # the user enables the toggle, so this returns ENODEV and exits silently
-    # when off. Backgrounded so a slow share never blocks boot.
-    # msize=512000 is the actual virtio-9p ceiling; asking for more just gets
-    # capped with a kernel warning.
+    # when off. Foreground so a missing /dev/fuse or kernel feature surfaces
+    # in the boot log instead of being swallowed.
+    # msize=262144 (256 KB) — well under QEMU's virtio-9p 512 KB ceiling and
+    # large enough to amortize round-trips for big reads. cache=mmap is the
+    # next-best after cache=fscache (which requires CONFIG_9P_FSCACHE=y, not
+    # in this kernel build); mmap still page-caches mapped regions and is
+    # noticeably better than cache=loose for re-reads.
     mkdir -p /mnt/downloads 2>/dev/null
-    mount -t 9p -o trans=virtio,version=9p2000.L,rw,msize=512000,cache=loose,noatime \
-        downloads /mnt/downloads 2>/dev/null &
+    mount -t 9p -o trans=virtio,version=9p2000.L,rw,msize=262144,cache=mmap,noatime \
+        downloads /mnt/downloads 2>/dev/null
 
     mkdir -p /dev/net 2>/dev/null
     [ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200 2>/dev/null
@@ -86,6 +90,22 @@ start() {
     # disk, sidestepping the nested-overlay rejection.
     mkdir -p /mnt/persist/docker /var/lib/docker 2>/dev/null
     mountpoint -q /var/lib/docker || mount --bind /mnt/persist/docker /var/lib/docker
+
+    # Same trick for Podman. Without this its overlay graph driver works
+    # (image pulls succeed) but each `podman run` falls back to
+    # fuse-overlayfs for the container's runtime mount — kernel overlay
+    # can't stack on the rootfs overlay we live on. Pinning Podman's
+    # store onto raw ext4 lets the kernel overlay stack cleanly and
+    # gives container IO the same speed Docker enjoys.
+    mkdir -p /mnt/persist/containers /var/lib/containers/storage 2>/dev/null
+    mountpoint -q /var/lib/containers/storage \
+        || mount --bind /mnt/persist/containers /var/lib/containers/storage
+
+    # And for LXC. The overlay storage backend (`lxc-create -B overlayfs`)
+    # has the same nested-overlay problem; even the default `dir` backend
+    # benefits from raw-ext4 IO over going through the rootfs overlay.
+    mkdir -p /mnt/persist/lxc /var/lib/lxc 2>/dev/null
+    mountpoint -q /var/lib/lxc || mount --bind /mnt/persist/lxc /var/lib/lxc
 
     # LXC: pre-create lxcbr0 (10.0.3.1/24) so `lxc-start` works out of the
     # box. Containers reach the internet via MASQUERADE → eth0 → SLIRP.

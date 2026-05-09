@@ -27,7 +27,7 @@ mount -t squashfs -o ro /dev/vdb /mnt/lower
 
 mkdir -p /mnt/persist/upper /mnt/persist/work
 mount -t overlay overlay \
-    -o lowerdir=/mnt/lower,upperdir=/mnt/persist/upper,workdir=/mnt/persist/work \
+    -o lowerdir=/mnt/lower,upperdir=/mnt/persist/upper,workdir=/mnt/persist/work,metacopy=on,redirect_dir=on,index=on \
     /mnt/overlay
 
 # Move /mnt/persist into the new root so users can reach raw storage,
