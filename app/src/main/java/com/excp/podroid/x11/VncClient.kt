@@ -64,4 +64,121 @@ object VncClient {
 
         return VncServerInfo(w, h, name)
     }
+
+    private const val MSG_FRAMEBUFFER_UPDATE: Int = 0
+    private const val ENC_RAW: Int = 0
+    private const val ENC_COPY_RECT: Int = 1
+
+    /**
+     * Sends SetPixelFormat to lock the server to 32-bit BGRA, then SetEncodings
+     * to advertise Raw + CopyRect. Call once after handshake before requesting
+     * any framebuffer update.
+     */
+    fun negotiatePixelFormat(out: OutputStream) {
+        // SetPixelFormat (msg=0): pad[3] + 16-byte PixelFormat
+        val pf = byteArrayOf(
+            0x00, 0x00, 0x00, 0x00,                         // msg + 3 pad
+            32, 24, 0, 1,                                   // bpp, depth, big-endian=0, true-color=1
+            0x00, 0xFF.toByte(), 0x00, 0xFF.toByte(), 0x00, 0xFF.toByte(),  // max RGB
+            16, 8, 0,                                       // shifts: R=16, G=8, B=0 (=> ARGB packed)
+            0, 0, 0,                                        // padding
+        )
+        out.write(pf)
+
+        // SetEncodings (msg=2): num-encodings=2, [Raw, CopyRect]
+        val se = byteArrayOf(
+            0x02, 0x00,                                     // msg + pad
+            0x00, 0x02,                                     // count = 2
+            0x00, 0x00, 0x00, 0x00,                         // Raw
+            0x00, 0x00, 0x00, 0x01,                         // CopyRect
+        )
+        out.write(se)
+        out.flush()
+    }
+
+    /**
+     * Send a FramebufferUpdateRequest. `incremental=false` forces the server
+     * to send a full refresh (use after first connect or on reconnect).
+     */
+    fun requestFramebufferUpdate(
+        out: OutputStream,
+        x: Int = 0, y: Int = 0,
+        w: Int = X11Constants.FB_WIDTH,
+        h: Int = X11Constants.FB_HEIGHT,
+        incremental: Boolean = true,
+    ) {
+        val buf = java.nio.ByteBuffer.allocate(10)
+        buf.put(3.toByte())                                 // msg-type
+        buf.put(if (incremental) 1.toByte() else 0)
+        buf.putShort(x.toShort())
+        buf.putShort(y.toShort())
+        buf.putShort(w.toShort())
+        buf.putShort(h.toShort())
+        out.write(buf.array())
+        out.flush()
+    }
+
+    /**
+     * Reads a FramebufferUpdate message and copies decoded pixels into `targetArgb`
+     * at row stride `stride`. Only Raw and CopyRect encodings are handled.
+     */
+    fun readFramebufferUpdate(inp: InputStream, targetArgb: IntArray, stride: Int) {
+        val din = DataInputStream(inp)
+        val msgType = din.readUnsignedByte()
+        require(msgType == MSG_FRAMEBUFFER_UPDATE) { "unexpected msg $msgType" }
+        din.skipBytes(1)
+        val numRects = din.readUnsignedShort()
+
+        repeat(numRects) {
+            val x = din.readUnsignedShort()
+            val y = din.readUnsignedShort()
+            val w = din.readUnsignedShort()
+            val h = din.readUnsignedShort()
+            val enc = din.readInt()
+
+            when (enc) {
+                ENC_RAW -> {
+                    // 4 bytes BGRA per pixel.
+                    val rowPixels = ByteArray(w * 4)
+                    for (row in 0 until h) {
+                        din.readFully(rowPixels)
+                        var off = 0
+                        val baseIdx = (y + row) * stride + x
+                        for (col in 0 until w) {
+                            val b = rowPixels[off].toInt() and 0xFF
+                            val g = rowPixels[off + 1].toInt() and 0xFF
+                            val r = rowPixels[off + 2].toInt() and 0xFF
+                            // Alpha byte from server is ignored — RFB true-color
+                            // doesn't really have alpha; we force opaque.
+                            targetArgb[baseIdx + col] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                            off += 4
+                        }
+                    }
+                }
+                ENC_COPY_RECT -> {
+                    val srcX = din.readUnsignedShort()
+                    val srcY = din.readUnsignedShort()
+                    // Copy with downward/upward order awareness.
+                    if (srcY < y) {
+                        for (row in h - 1 downTo 0) {
+                            System.arraycopy(
+                                targetArgb, (srcY + row) * stride + srcX,
+                                targetArgb, (y + row) * stride + x,
+                                w,
+                            )
+                        }
+                    } else {
+                        for (row in 0 until h) {
+                            System.arraycopy(
+                                targetArgb, (srcY + row) * stride + srcX,
+                                targetArgb, (y + row) * stride + x,
+                                w,
+                            )
+                        }
+                    }
+                }
+                else -> error("unsupported encoding $enc")
+            }
+        }
+    }
 }

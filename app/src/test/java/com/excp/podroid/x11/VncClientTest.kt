@@ -48,4 +48,34 @@ class VncClientTest {
         // Byte 13: ClientInit shared flag = 1
         assertEquals(1, sent[13].toInt())
     }
+
+    @Test
+    fun `Raw rectangle update writes pixels into target ARGB buffer`() {
+        // Pre-built FramebufferUpdate message:
+        //   msg-type=0, padding, num-rects=1
+        //   rect: x=0, y=0, w=2, h=1, encoding=0 (Raw)
+        //   pixels: 2 BGRA pixels = red, green
+        val msg = byteArrayOf(
+            0x00, 0x00,             // msg-type, padding
+            0x00, 0x01,             // num rects
+            0x00, 0x00, 0x00, 0x00, // x=0, y=0
+            0x00, 0x02, 0x00, 0x01, // w=2, h=1
+            0x00, 0x00, 0x00, 0x00, // encoding = 0 (Raw)
+            // Pixel 0: BGRA = (0, 0, 0xFF, 0xFF) -> red
+            0x00, 0x00, 0xFF.toByte(), 0xFF.toByte(),
+            // Pixel 1: BGRA = (0, 0xFF, 0, 0xFF) -> green
+            0x00, 0xFF.toByte(), 0x00, 0xFF.toByte(),
+        )
+        val target = IntArray(2)
+
+        VncClient.readFramebufferUpdate(
+            inp = java.io.ByteArrayInputStream(msg),
+            targetArgb = target,
+            stride = 2,
+        )
+
+        // ARGB packed: 0xAARRGGBB
+        assertEquals(0xFFFF0000.toInt(), target[0])  // red
+        assertEquals(0xFF00FF00.toInt(), target[1])  // green
+    }
 }
