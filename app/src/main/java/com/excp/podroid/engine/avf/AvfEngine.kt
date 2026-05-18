@@ -100,10 +100,17 @@ class AvfEngine @Inject constructor(
     private var consoleStream: java.io.InputStream? = null
     private var consoleStreamInput: java.io.OutputStream? = null
     private var fanout: ConsoleFanout? = null
-    /** Initial rules captured from start()'s portForwards arg — replayed when the control channel comes up. */
-    private val initialRules = mutableListOf<com.excp.podroid.data.repository.PortForwardRule>()
     @Volatile private var control: VsockControlChannel? = null
-    /** vport → forwarder. The diff loop in EngineHolder is the single writer. */
+    /**
+     * Initial rules captured from start()'s portForwards arg — includes the
+     * auto-injected SSH/X11/audio rules that PodroidService adds in-memory
+     * (not in DataStore), which EngineHolder's diff loop never sees. Replayed
+     * via addPortForward() in the onReady callback. The putIfAbsent dedup in
+     * addPortForward handles the race with EngineHolder's parallel dispatch
+     * of DataStore rules — whichever path wins owns the forwarder.
+     */
+    private val initialRules = mutableListOf<com.excp.podroid.data.repository.PortForwardRule>()
+    /** vport → forwarder. Written via addPortForward/removePortForward only. */
     private val forwarders = java.util.concurrent.ConcurrentHashMap<Int, VsockPortForwarder>()
     @Volatile private var lastSentRows = -1
     @Volatile private var lastSentCols = -1
@@ -126,27 +133,18 @@ class AvfEngine @Inject constructor(
         android.os.Handler(android.os.Looper.getMainLooper()).post {
             runCatching { terminalSession?.emulator?.append(reset, reset.size) }
         }
-        // Bring up the vsock control channel and replay initial forwards.
-        // EngineHolder's diff loop will keep the set in sync from here on.
+        // Bring up the vsock control channel. EngineHolder's diff loop fires
+        // on state → Running and dispatches DataStore rules; we replay the
+        // initialRules here too because PodroidService auto-injects SSH/X11/
+        // audio rules in-memory (never in DataStore) and EngineHolder never
+        // sees them. addPortForward's putIfAbsent dedups the parallel path.
         val vm = vmHandle
         if (vm != null) {
             val ctl = VsockControlChannel(vm, scope)
             control = ctl
             ctl.open()
             scope.launch {
-                for (rule in initialRules) {
-                    runCatching {
-                        // Same convention as addPortForward: vport = hostPort.
-                        val fw = VsockPortForwarder(
-                            hostPort = rule.hostPort,
-                            guestVsockPort = rule.hostPort,
-                            vm = vm,
-                            scope = scope,
-                        ).also { it.start() }
-                        forwarders[rule.hostPort] = fw
-                        ctl.addForward(rule.hostPort, "127.0.0.1", rule.guestPort)
-                    }.onFailure { Log.w(TAG, "initial-rule replay failed for $rule", it) }
-                }
+                for (rule in initialRules) addPortForward(rule)
             }
         }
     }
@@ -463,19 +461,28 @@ class AvfEngine @Inject constructor(
         AvfReflect.setName(cb, VM_NAME)
         AvfReflect.setKernelPath(cb, kernel.absolutePath)
         AvfReflect.setInitrdPath(cb, initrd.absolutePath)
-        // AVF picks the console device via setConsoleInputDevice on the outer
-        // builder; the kernel discovers it through DT/ACPI tables crosvm sets up.
-        // Don't pass `console=` here — it'll fight AVF's choice.
-        // `podroid.tty=ttyS0` tells /usr/local/bin/podroid-getty to spawn
-        // the login on PL011 serial (AVF's only console with an input fd).
-        // The hvc0 getty becomes a no-op sleeper instead of dual-printing.
+        // Console wiring: hvc0 (virtio-console), NOT ttyS0 (PL011 UART).
+        // crosvm's PL011 is rate-limited to ~14 KB/s — fine for boot logs,
+        // catastrophic for TUI redraws (a btop frame is 8–16 KB, so each
+        // refresh takes ~700 ms–1 s on ttyS0). virtio-console runs at host
+        // memory speed. setConsoleInputDevice(hvc0) tells AVF to wire its
+        // captured input/output streams to hvc0; `console=hvc0` in the
+        // kernel cmdline routes kernel logs the same way; the guest's
+        // /etc/inittab spawns the getty on the device named by the
+        // `podroid.tty=` marker.
         //
-        // `podroid.epoch=...` seeds the guest's wall clock from the host —
-        // AVF doesn't wire an emulated RTC like QEMU TCG does, so without
-        // this the VM boots at 1970-01-01 and TLS fails on every cert.
+        // `podroid.backend=avf` is a stable backend identifier — used by
+        // guest OpenRC scripts (podroid-network, podroid-vsock) to pick
+        // AVF-specific behaviour without coupling to the tty choice.
+        //
+        // `podroid.epoch=...` seeds the wall clock — AVF/crosvm doesn't
+        // wire an RTC the way QEMU TCG does, so without this the guest
+        // boots at 1970-01-01 and TLS fails on every cert.
         val epoch = System.currentTimeMillis() / 1000
         AvfReflect.addParams(cb,
-            "root=/dev/ram0 mitigations=off elevator=mq-deadline podroid.tty=ttyS0 podroid.epoch=$epoch ${config.kernelExtraCmdline}".trim()
+            "console=hvc0 root=/dev/ram0 mitigations=off elevator=mq-deadline " +
+            "podroid.tty=hvc0 podroid.backend=avf podroid.epoch=$epoch " +
+            "${config.kernelExtraCmdline}".trim()
         )
         AvfReflect.addDisk(cb, storage.absolutePath, writable = true)
         AvfReflect.addDisk(cb, squashfs.absolutePath, writable = false)
@@ -483,11 +490,18 @@ class AvfEngine @Inject constructor(
             val downloads = android.os.Environment.getExternalStoragePublicDirectory(
                 android.os.Environment.DIRECTORY_DOWNLOADS
             ).absolutePath
-            runCatching {
-                // hostUid/hostGid are this app's UID — AVF requires per-user
-                // identity even though we share a single uid/gid for app procs.
-                // guestUid=1000 (Alpine root, who runs the mount), gid=100
-                // (users), mask 0007 = group-readable, world-blocked.
+            // External-storage paths (/storage/emulated/...) live outside the
+            // app's SELinux domain. AOSP TerminalApp's ConfigJson.SharedPathJson
+            // handles this by passing appDomain=false so crosvm spins up as a
+            // child of virtmgr (system domain) instead of inheriting our
+            // untrusted_app domain. Without that, crosvm gets EACCES on the
+            // first read and the VM dies with reason=4 at start.
+            //
+            // On AVF revisions that don't ship the 10-param ctor with
+            // appDomain, AvfReflect refuses the share (returns false) and we
+            // boot without it — better than crashing the VM. The toggle in
+            // Settings just becomes a no-op on those devices.
+            val ok = runCatching {
                 AvfReflect.addSharedPath(
                     customBuilder = cb,
                     sharedPath = downloads,
@@ -497,10 +511,15 @@ class AvfEngine @Inject constructor(
                     guestUid = 1000,
                     guestGid = 100,
                     mask = 0x0007,
-                    socketPath = "${context.filesDir.absolutePath}/avf-virtfs-downloads.sock",
+                    socket = "downloads",
+                    socketPath = "",
+                    appDomain = false,
                 )
-                Log.i(TAG, "downloads share added: $downloads")
-            }.onFailure { Log.w(TAG, "addSharedPath failed (continuing without share)", it) }
+            }.getOrElse { e ->
+                Log.w(TAG, "addSharedPath threw (continuing without share)", e); false
+            }
+            if (ok) Log.i(TAG, "downloads share added: $downloads")
+            else Log.i(TAG, "downloads share NOT added — Settings toggle is a no-op on this AVF revision")
         }
         AvfReflect.setNetworkSupported(cb, true)
         val customCfg = AvfReflect.build(cb)
@@ -510,7 +529,7 @@ class AvfEngine @Inject constructor(
         AvfReflect.setMemoryBytes(vb, config.ramMb.toLong() * 1024 * 1024)
         AvfReflect.setNumCpus(vb, config.cpus)
         AvfReflect.setDebugLevel(vb, AvfReflect.DEBUG_LEVEL_FULL)
-        AvfReflect.setConsoleInputDevice(vb, "ttyS0")        // AVF expects ttyS0
+        AvfReflect.setConsoleInputDevice(vb, "hvc0")         // virtio-console (line-rate), NOT PL011
         AvfReflect.setConnectVmConsole(vb, false)            // false: avoid inheriting Activity FDs (SurfaceFlinger sync fences → SELinux denial)
         AvfReflect.setVmOutputCaptured(vb, true)
         AvfReflect.setVmConsoleInputSupported(vb, true)
