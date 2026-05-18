@@ -101,7 +101,7 @@ class AvfEngine @Inject constructor(
     private var fanout: ConsoleFanout? = null
     /** Initial rules captured from start()'s portForwards arg — replayed when the control channel comes up. */
     private val initialRules = mutableListOf<com.excp.podroid.data.repository.PortForwardRule>()
-    private var control: VsockControlChannel? = null
+    @Volatile private var control: VsockControlChannel? = null
     /** vport → forwarder. The diff loop in EngineHolder is the single writer. */
     private val forwarders = java.util.concurrent.ConcurrentHashMap<Int, VsockPortForwarder>()
 
@@ -275,11 +275,6 @@ class AvfEngine @Inject constructor(
             Log.w(TAG, "addPortForward($rule) — AVF supports TCP only; rule ignored")
             return
         }
-        // Idempotent: if a forwarder is already running for this hostPort, no-op.
-        if (forwarders.containsKey(rule.hostPort)) {
-            Log.d(TAG, "addPortForward($rule) — forwarder already exists for ${rule.hostPort}")
-            return
-        }
         try {
             // Convention: vsock port == hostPort. The guest agent listens on
             // vsock:hostPort and splices to tcp 127.0.0.1:guestPort. Using
@@ -291,11 +286,29 @@ class AvfEngine @Inject constructor(
                 guestVsockPort = rule.hostPort,
                 vm = vm,
                 scope = scope,
-            ).also { it.start() }
-            forwarders[rule.hostPort] = fw
+            )
+            // putIfAbsent races safely with another concurrent addPortForward
+            // for the same hostPort — only one forwarder wins; the loser closes
+            // immediately so we don't leak a bound ServerSocket.
+            val existing = forwarders.putIfAbsent(rule.hostPort, fw)
+            if (existing != null) {
+                Log.d(TAG, "addPortForward($rule) — forwarder already exists for ${rule.hostPort}")
+                return
+            }
+            // Re-check Running state before .start() so a concurrent cleanup()
+            // doesn't orphan us. If state has slipped, drop the freshly-mapped
+            // forwarder and don't bind the ServerSocket.
+            if (_state.value !is VmState.Running) {
+                forwarders.remove(rule.hostPort)
+                return
+            }
+            fw.start()
             control?.addForward(rule.hostPort, "127.0.0.1", rule.guestPort)
             Log.i(TAG, "live forward up: 0.0.0.0:${rule.hostPort} → vsock:${rule.hostPort} → 127.0.0.1:${rule.guestPort}")
         } catch (e: Throwable) {
+            // If we got past putIfAbsent before the throw, remove ourselves so
+            // cleanup() doesn't try to close a half-built forwarder.
+            forwarders.remove(rule.hostPort)
             Log.w(TAG, "addPortForward($rule) failed", e)
         }
     }
