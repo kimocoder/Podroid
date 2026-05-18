@@ -41,8 +41,10 @@
 /* Coalesce per-frame SIGWINCH bursts (Android keyboard slide fires ~25 of
  * them in 200 ms) into a single RESIZE message. The shell only redraws once,
  * so the user sees one prompt redraw at the end of the animation instead of
- * 25 cursor flashes during it. */
-#define RESIZE_DEBOUNCE_MS 200
+ * 25 cursor flashes during it. 80 ms is enough to coalesce a slide burst — the
+ * keyboard finishes at 200 ms, the LAST SIGWINCH is the only one that matters,
+ * and shorter than ~80 ms risks firing mid-animation. */
+#define RESIZE_DEBOUNCE_MS 80
 
 static volatile sig_atomic_t g_winch    = 0;
 static volatile sig_atomic_t g_shutdown = 0;
@@ -51,8 +53,33 @@ static int                   g_term_fd   = -1;
 static int                   g_winch_pending  = 0;
 static long                  g_winch_last_ms  = 0;
 
-static void on_winch(int sig) { (void)sig; g_winch = 1; }
-static void on_term(int sig)  { (void)sig; g_shutdown = 1; }
+/* Self-pipe pair so signal handlers can wake select() instead of forcing the
+ * main loop to poll on a short timeout. g_wake_fd[1] is written by the
+ * handlers (write() is async-signal-safe); g_wake_fd[0] is added to select's
+ * read set and drained whenever it fires. This replaces the previous 50 ms
+ * polling timeout — keystroke round-trip drops by up to ~50 ms. */
+static int                   g_wake_fd[2] = { -1, -1 };
+
+static void on_winch(int sig) {
+    (void)sig;
+    g_winch = 1;
+    /* Wake select() so the main loop notices the signal and (re)starts the
+     * debounce timer. errno preservation via write()'s contract. */
+    if (g_wake_fd[1] >= 0) {
+        char b = 'w';
+        ssize_t n = write(g_wake_fd[1], &b, 1);
+        (void)n; /* errno (e.g. EAGAIN) is harmless — handler will retrigger */
+    }
+}
+static void on_term(int sig)  {
+    (void)sig;
+    g_shutdown = 1;
+    if (g_wake_fd[1] >= 0) {
+        char b = 't';
+        ssize_t n = write(g_wake_fd[1], &b, 1);
+        (void)n;
+    }
+}
 
 static long now_ms(void) {
     struct timespec ts;
@@ -148,6 +175,16 @@ int main(int argc, char *argv[]) {
 
     send_resize();
 
+    /* Self-pipe for signal-to-select wakeup. AF_UNIX socketpair gives bidirec-
+     * tional fds; we only use one direction. Set O_NONBLOCK on the write end
+     * so a flood of signals can never block the signal handler. */
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, g_wake_fd) == 0) {
+        int flags = fcntl(g_wake_fd[1], F_GETFL, 0);
+        if (flags >= 0) fcntl(g_wake_fd[1], F_SETFL, flags | O_NONBLOCK);
+        int rflags = fcntl(g_wake_fd[0], F_GETFL, 0);
+        if (rflags >= 0) fcntl(g_wake_fd[0], F_SETFL, rflags | O_NONBLOCK);
+    }
+
     signal(SIGWINCH, on_winch);
     signal(SIGINT,   on_term);
     signal(SIGTERM,  on_term);
@@ -178,9 +215,31 @@ int main(int argc, char *argv[]) {
         FD_SET(STDIN_FILENO, &rfds);
         FD_SET(g_term_fd,    &rfds);
         int nfds = (g_term_fd > STDIN_FILENO ? g_term_fd : STDIN_FILENO) + 1;
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
-        int ret = select(nfds, &rfds, NULL, NULL, &tv);
+        if (g_wake_fd[0] >= 0) {
+            FD_SET(g_wake_fd[0], &rfds);
+            if (g_wake_fd[0] >= nfds) nfds = g_wake_fd[0] + 1;
+        }
+
+        /* Block indefinitely when no winch is in flight (input drives wakeups).
+         * When a winch is pending, sleep only until the debounce window closes
+         * so send_resize() fires promptly. */
+        struct timeval  tv;
+        struct timeval *tvp = NULL;
+        if (g_winch_pending) {
+            long remain = RESIZE_DEBOUNCE_MS - (now_ms() - g_winch_last_ms);
+            if (remain < 0) remain = 0;
+            tv.tv_sec  = remain / 1000;
+            tv.tv_usec = (remain % 1000) * 1000;
+            tvp = &tv;
+        }
+        int ret = select(nfds, &rfds, NULL, NULL, tvp);
         if (ret < 0) { if (errno == EINTR) continue; break; }
+
+        /* Drain wake fd — its only purpose is to break us out of select(). */
+        if (g_wake_fd[0] >= 0 && FD_ISSET(g_wake_fd[0], &rfds)) {
+            char drain[64];
+            while (read(g_wake_fd[0], drain, sizeof(drain)) > 0) { /* spin */ }
+        }
 
         if (FD_ISSET(STDIN_FILENO, &rfds)) {
             int n = read(STDIN_FILENO, buf, sizeof(buf));
