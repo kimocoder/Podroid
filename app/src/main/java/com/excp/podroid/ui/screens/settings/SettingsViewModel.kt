@@ -184,22 +184,15 @@ class SettingsViewModel @Inject constructor(
 
     // "both" expands into separate TCP + UDP rules. Existing rules with the
     // same host port + protocol are skipped so the persisted Set doesn't grow.
+    // Live add/remove is handled by EngineHolder's rule-diff loop — we just
+    // write to DataStore and the holder picks up the change.
     fun addPortForward(hostPort: Int, guestPort: Int, protocol: String = "tcp") {
         val protos = if (protocol == "both") listOf("tcp", "udp") else listOf(protocol)
         viewModelScope.launch {
             val existing = portForwardRules.value.toSet()
             protos.forEach { proto ->
-                val rule = PortForwardRule(hostPort, guestPort, proto)
                 if (existing.any { it.hostPort == hostPort && it.protocol == proto }) return@forEach
-                portForwardRepository.addRule(rule)
-                if (engine.state.value is VmState.Running) {
-                    val qmp = engine.qmpClient
-                    if (qmp == null) {
-                        android.util.Log.w("SettingsVM", "port forwarding not supported by backend=${engine.backendId}")
-                    } else {
-                        qmp.addPortForward(hostPort, guestPort, proto)
-                    }
-                }
+                portForwardRepository.addRule(PortForwardRule(hostPort, guestPort, proto))
             }
         }
     }
@@ -211,17 +204,7 @@ class SettingsViewModel @Inject constructor(
     fun activeBackendId(): String = engine.backendId
 
     fun removePortForward(rule: PortForwardRule) {
-        viewModelScope.launch {
-            portForwardRepository.removeRule(rule)
-            if (engine.state.value is VmState.Running) {
-                val qmp = engine.qmpClient
-                if (qmp == null) {
-                    android.util.Log.w("SettingsVM", "port forwarding not supported by backend=${engine.backendId}")
-                } else {
-                    qmp.removePortForward(rule.hostPort, rule.protocol)
-                }
-            }
-        }
+        viewModelScope.launch { portForwardRepository.removeRule(rule) }
     }
 
     fun resetVm() {
