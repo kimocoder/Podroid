@@ -1,4 +1,14 @@
 # build-rootfs/Dockerfile.rootfs
+
+# ── Stage 1: cross-compile podroid-vsock-agent (musl-static aarch64) ────────
+# Uses qemu-user under the hood — no separate cross-toolchain needed.
+FROM --platform=linux/arm64 alpine:3.23 AS vsock-builder
+RUN apk add --no-cache musl-dev gcc make linux-headers
+WORKDIR /work
+COPY vsock-agent /work/vsock-agent
+RUN cd /work/vsock-agent && make CC=gcc
+
+# ── Stage 2: build the Alpine rootfs squashfs ───────────────────────────────
 FROM alpine:3.23 AS builder
 
 ARG ALPINE_RELEASE=3.23.4
@@ -12,6 +22,9 @@ RUN curl -L -o minirootfs.tar.gz \
  && mkdir rootfs \
  && tar -xzf minirootfs.tar.gz -C rootfs \
  && rm minirootfs.tar.gz
+
+# Pull in the vsock-agent binary built in stage 1.
+COPY --from=vsock-builder /work/vsock-agent/podroid-vsock-agent /work/rootfs/usr/local/bin/podroid-vsock-agent
 
 ENV ALPINE_VERSION=${ALPINE_RELEASE}
 COPY files /work/files
