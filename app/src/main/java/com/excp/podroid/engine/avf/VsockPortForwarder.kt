@@ -60,7 +60,12 @@ class VsockPortForwarder(
         val pfd = try {
             AvfReflect.connectVsock(vm, guestVsockPort.toLong())
         } catch (e: Throwable) {
-            Log.w(TAG, "connectVsock($guestVsockPort) failed: ${e.message}")
+            // Surface the underlying ErrnoException class — e.message alone is
+            // null for many ECONNREFUSED/EAFNOSUPPORT paths, so the bare
+            // "${e.message}" gave "failed: null" with zero diagnostic value.
+            val cause = e.cause ?: e
+            Log.w(TAG, "connectVsock($guestVsockPort) failed: " +
+                "${cause.javaClass.simpleName}: ${cause.message ?: "(no message)"}")
             runCatching { tcp.close() }
             return@coroutineScope
         }
