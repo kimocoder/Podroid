@@ -44,16 +44,33 @@ class PodroidApplication : Application() {
     }
 
     private fun extractAssets() {
+        // Asset extraction has a self-healing version stamp: on every install
+        // or upgrade `packageInfo.lastUpdateTime` changes, so we record it in
+        // `.assets_stamp` and force a re-copy on mismatch. Pure size checks
+        // are deceiving because `mksquashfs -all-root -noappend` is
+        // deterministic — changing service scripts inside the rootfs can
+        // produce a byte-identical-size file with different content, which
+        // older extraction logic silently kept stale.
+        val stampFile = File(filesDir, ".assets_stamp")
+        val currentStamp = runCatching {
+            packageManager.getPackageInfo(packageName, 0).lastUpdateTime
+        }.getOrDefault(0L).toString()
+        val previousStamp = runCatching { stampFile.readText() }.getOrDefault("")
+        val forceCopy = previousStamp != currentStamp
+        if (forceCopy) {
+            Log.i(TAG, "asset stamp drift ($previousStamp → $currentStamp) — forcing re-extract")
+        }
+
         // Fan out the four top-level extractions across a small thread pool.
-        // Disk-write throughput is the bottleneck for the squashfs (~41 MB),
+        // Disk-write throughput is the bottleneck for the squashfs (~225 MB),
         // but decompression, asset-FD lookup, and skip-when-size-matches all
         // overlap usefully across threads. Must complete before onCreate
         // returns — the QEMU launch path reads these files synchronously.
         val tasks: List<() -> Unit> = listOf(
-            { copyAssetDir("qemu", filesDir) },
-            { copyAssetIfNeeded("vmlinuz-virt", filesDir) },
-            { copyAssetIfNeeded("initrd.img", filesDir) },
-            { copyAssetIfNeeded("alpine-rootfs.squashfs", filesDir) },
+            { copyAssetDir("qemu", filesDir, forceCopy) },
+            { copyAssetIfNeeded("vmlinuz-virt", filesDir, forceCopy) },
+            { copyAssetIfNeeded("initrd.img", filesDir, forceCopy) },
+            { copyAssetIfNeeded("alpine-rootfs.squashfs", filesDir, forceCopy) },
         )
         val pool = Executors.newFixedThreadPool(tasks.size.coerceAtMost(4))
         try {
@@ -76,18 +93,25 @@ class PodroidApplication : Application() {
                 pool.shutdownNow()
             }
         }
+
+        // Commit the new stamp only after extraction so a half-finished copy
+        // (process killed mid-extract) doesn't leave us thinking we're done.
+        runCatching { stampFile.writeText(currentStamp) }
+            .onFailure { Log.w(TAG, "Failed to write assets stamp", it) }
     }
 
     /**
-     * Copies an asset to destDir if missing or size-different.
-     * Uses openFd() for an O(1) size lookup; that throws for compressed
-     * assets, in which case we fall back to always copying.
+     * Copies an asset to destDir if missing OR if the size differs OR if the
+     * install-time stamp drifted. The stamp is the key bit: `mksquashfs` is
+     * deterministic, so an upgrade can ship a same-size squashfs with
+     * different content (e.g. an init.d script edited) — size-only checks
+     * would silently keep the stale copy and the VM boots the old rootfs.
      */
-    private fun copyAssetIfNeeded(assetName: String, destDir: File) {
+    private fun copyAssetIfNeeded(assetName: String, destDir: File, forceCopy: Boolean) {
         val destFile = File(destDir, assetName)
         try {
             val assetSize = try { assets.openFd(assetName).use { it.length } } catch (_: Exception) { -1L }
-            if (assetSize >= 0 && destFile.exists() && destFile.length() == assetSize) return
+            if (!forceCopy && assetSize >= 0 && destFile.exists() && destFile.length() == assetSize) return
 
             assets.open(assetName).use { input ->
                 destFile.parentFile?.mkdirs()
@@ -100,11 +124,10 @@ class PodroidApplication : Application() {
 
     /**
      * Walks an asset directory tree and mirrors it under destDir.
-     * Each file is copied if missing OR if its size differs (handles app
-     * upgrades that ship modified BIOS/keymap files — pre-1.1.6 this used
-     * !exists() and silently kept stale copies).
+     * Each file is copied if missing OR if its size differs OR if forceCopy
+     * is true (install-stamp drift).
      */
-    private fun copyAssetDir(assetPath: String, destDir: File) {
+    private fun copyAssetDir(assetPath: String, destDir: File, forceCopy: Boolean) {
         val entries = assets.list(assetPath) ?: return
         for (entry in entries) {
             val src = "$assetPath/$entry"
@@ -112,17 +135,17 @@ class PodroidApplication : Application() {
             val subEntries = assets.list(src)
             if (subEntries != null && subEntries.isNotEmpty()) {
                 dest.mkdirs()
-                copyAssetDir(src, dest)
+                copyAssetDir(src, dest, forceCopy)
             } else {
-                copyAssetFileIfNeeded(src, dest)
+                copyAssetFileIfNeeded(src, dest, forceCopy)
             }
         }
     }
 
-    private fun copyAssetFileIfNeeded(assetPath: String, destFile: File) {
+    private fun copyAssetFileIfNeeded(assetPath: String, destFile: File, forceCopy: Boolean) {
         try {
             val assetSize = try { assets.openFd(assetPath).use { it.length } } catch (_: Exception) { -1L }
-            if (assetSize >= 0 && destFile.exists() && destFile.length() == assetSize) return
+            if (!forceCopy && assetSize >= 0 && destFile.exists() && destFile.length() == assetSize) return
 
             assets.open(assetPath).use { input ->
                 destFile.outputStream().use { output -> input.copyTo(output) }
