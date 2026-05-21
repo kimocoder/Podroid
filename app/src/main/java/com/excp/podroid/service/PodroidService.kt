@@ -7,6 +7,7 @@
  */
 package com.excp.podroid.service
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
@@ -15,6 +16,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
@@ -22,6 +24,7 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import com.excp.podroid.MainActivity
 import com.excp.podroid.PodroidApplication
 import com.excp.podroid.R
@@ -69,6 +72,17 @@ class PodroidService : Service() {
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
                 } else {
                     0
+                }
+                // Non-fatal diagnostic: on API 33+ a missing POST_NOTIFICATIONS
+                // grant makes the persistent notification (and its Stop action)
+                // invisible while the WakeLock is held. We do NOT gate VM start on
+                // this, just log so the invisible-notification state is
+                // diagnosable. (The setup screen requests the permission.)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                        != PackageManager.PERMISSION_GRANTED) {
+                    Log.w(TAG, "POST_NOTIFICATIONS not granted; foreground notification " +
+                        "and its Stop action will be invisible while the VM holds the WakeLock")
                 }
                 // Always (re-)assert foreground within the start window — required
                 // even on a redundant ACTION_START so the system doesn't fault us
@@ -258,6 +272,17 @@ class PodroidService : Service() {
                     engine.start(rules, config)
                 } catch (e: Exception) {
                     Log.e(TAG, "QEMU failed to start", e)
+                    // A Service-side throw here (failed asset extraction, a
+                    // snapshot read, or engine.start()) can happen before the
+                    // engine state ever leaves Idle. In that window the shutdown
+                    // observer's seenActive latch is still false, so its Idle
+                    // branch returns without teardown and nothing releases the
+                    // no-timeout WakeLock or drops the foreground notification.
+                    // Tear down here so a start failure cleans itself up.
+                    // teardown() is idempotent (releaseWakeLock guards on isHeld),
+                    // and this only runs on a thrown exception, never the success
+                    // path. Hop back to Main since teardown touches the service.
+                    withContext(Dispatchers.Main) { teardown() }
                 }
             }
         }
