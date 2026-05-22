@@ -58,6 +58,10 @@ class AvfEngine @Inject constructor(
         // doesn't strand the engine in Starting forever — EngineHolder.trySwap
         // waits on a terminal state, so a stuck Starting blocks backend switch.
         private const val BOOT_TIMEOUT_MS = 60_000L
+        // Upper bound on the best-effort guest flush before stop. Bounded so a
+        // hung guest can never block the stop path; the caller proceeds to kill
+        // the VM if no SYNCED ack arrives.
+        private const val SYNC_TIMEOUT_MS = 8_000L
     }
 
     private val _state = MutableStateFlow<VmState>(VmState.Idle)
@@ -432,18 +436,19 @@ class AvfEngine @Inject constructor(
         // is mapped to Stopped (never downgraded to Error) by the funnel.
         stopRequested = true
         val generation = vmGeneration
-        // Surface (don't swallow) a framework stop() failure: if the request was
-        // rejected the VM is still alive, and we must NOT null the handle (cleanup
-        // nulls it) or we'd leak an unkillable VM. Retain the handle so the
-        // watchdog below can retry / so a later stop() can act on it.
-        val requested = runCatching { AvfReflect.stop(vm) }
-            .onFailure { Log.w(TAG, "AVF stop() request failed; VM may still be running", it) }
-            .isSuccess
-        // Drive the final Stopped + cleanup from the onStopped/onDied callback so
-        // we don't tear down a still-live VM. If the framework never delivers a
-        // terminal callback (or stop() was rejected), a bounded watchdog forces
-        // the transition so the engine never strands in Running/Starting.
         scope.launch {
+            // Best-effort guest flush so unwritten ext4 data hits storage before
+            // we kill the VM. Bounded so a hung guest can't block the stop.
+            runCatching { control?.syncAndWait(SYNC_TIMEOUT_MS) }
+            if (generation != vmGeneration || cleanedUp.get()) return@launch
+            // Surface (don't swallow) a framework stop() failure: if rejected the
+            // VM is still alive, and we must NOT null the handle.
+            val requested = runCatching { AvfReflect.stop(vm) }
+                .onFailure { Log.w(TAG, "AVF stop() request failed; VM may still be running", it) }
+                .isSuccess
+            // Drive the final Stopped + cleanup from onStopped/onDied. If no
+            // terminal callback arrives (or stop() was rejected), a bounded
+            // watchdog forces the transition so we never strand in Running.
             kotlinx.coroutines.delay(if (requested) 5_000L else 1_000L)
             if (generation == vmGeneration && !cleanedUp.get()) {
                 Log.w(TAG, "AVF stop: no terminal callback within timeout — forcing Stopped")

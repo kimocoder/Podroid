@@ -513,6 +513,10 @@ static void ctl_loop(int fd) {
         } else if (strcmp(line, "PING") == 0) {
             fprintf(out, "PONG\n");
             fflush(out);
+        } else if (strcmp(line, "SYNC") == 0) {
+            sync();              /* flush all guest filesystem buffers to virtio-blk */
+            fprintf(out, "SYNCED\n");
+            fflush(out);
         } else if (line[0] != '\0') {
             LOG_W("unknown command: '%s'", line);
         }

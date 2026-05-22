@@ -12,6 +12,7 @@
  *   ADD    <vport> tcp <host> <gport>
  *   REMOVE <vport>
  *   PING                      → agent replies "PONG\n" (we ignore the reply)
+ *   SYNC                      → agent runs sync(2), replies "SYNCED\n"
  */
 package com.excp.podroid.engine.avf
 
@@ -24,6 +25,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.PrintWriter
 
 @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
@@ -170,6 +172,37 @@ class VsockControlChannel(
     fun sendResize(rows: Int, cols: Int)             = sendOrQueue("RESIZE $rows $cols")
     fun addForward(vport: Int, host: String, gport: Int) = sendOrQueue("ADD $vport tcp $host $gport")
     fun removeForward(vport: Int)                    = sendOrQueue("REMOVE $vport")
+
+    /**
+     * Deterministic guest flush before stop: tells the agent to sync(2) and waits
+     * up to timeoutMs for the "SYNCED" ack. Best-effort - returns true only on a
+     * SYNCED ack within the timeout; false if the channel is down, the write
+     * fails, or no ack arrives in time. The caller then just proceeds to stop.
+     */
+    suspend fun syncAndWait(timeoutMs: Long): Boolean {
+        val pfdLocal: ParcelFileDescriptor
+        synchronized(this) {
+            val w = writer
+            val p = pfd
+            if (closed || w == null || p == null) return false
+            if (!writeLine(w, "SYNC")) return false
+            pfdLocal = p
+        }
+        // Read the ack OUTSIDE the monitor so a slow guest can't hold the lock.
+        return withContext(Dispatchers.IO) {
+            kotlinx.coroutines.withTimeoutOrNull(timeoutMs) {
+                val reader = java.io.BufferedReader(java.io.InputStreamReader(
+                    java.io.FileInputStream(pfdLocal.fileDescriptor)))
+                // Do NOT close `reader`: it wraps the same fd the writer/pfd own;
+                // close() owns the pfd. A read still blocked at timeout unblocks
+                // when close()/cleanup shuts the fd moments later, which is fine on
+                // the stop path.
+                var line = reader.readLine()
+                while (line != null && line != "SYNCED") line = reader.readLine()
+                line == "SYNCED"
+            } ?: false
+        }
+    }
 
     @Synchronized fun close() {
         if (closed) return
