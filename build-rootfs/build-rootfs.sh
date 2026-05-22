@@ -22,7 +22,7 @@ apk -X "https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_BRANCH}/main" \
     bash \
     podman \
     docker docker-openrc docker-cli-compose \
-    lxc lxc-templates lxc-openrc lxc-bridge \
+    lxc lxc-templates lxc-download lxc-openrc lxc-bridge \
     crun \
     fuse-overlayfs \
     iptables \
@@ -40,6 +40,7 @@ apk -X "https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_BRANCH}/main" \
     doas sudo \
     gcompat \
     gzip \
+    xz \
     tigervnc \
     pulseaudio \
     pulseaudio-utils \
