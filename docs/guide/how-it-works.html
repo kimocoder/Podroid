@@ -74,12 +74,15 @@
       </div>
 
       <h2>Init system: OpenRC</h2>
-      <p>OpenRC is PID 1 inside the guest. Three app-specific services on the squashfs handle bring-up:</p>
+      <p>OpenRC is PID 1 inside the guest. Several app-specific services on the squashfs handle bring-up; the three that drive the boot log are:</p>
       <ul>
         <li><strong>podroid-bootstrap:</strong> kernel modules, cgroup v2, ZRAM swap, devpts/shm/mqueue mounts, sysctl, hostname.</li>
         <li><strong>podroid-network:</strong> brings up eth0, assigns 10.0.2.15/24, sets the default route and /etc/resolv.conf (SLIRP provides NAT).</li>
         <li><strong>podroid-ready:</strong> emits the "Starting SSH...", "Almost ready...", and "Ready!" markers that the app tracks to update the notification and unlock the terminal.</li>
       </ul>
+
+      <h2>Guest-to-Android bridge</h2>
+      <p>A small daemon, <code>podroid-hostd</code>, lets processes inside the VM reach back to Android. It listens on a guest-local Unix socket and relays one-line requests to the app over the same control transport the VM already uses - a virtio-console port on QEMU, vsock on AVF. Two CLIs are wired to it: <code>podroid-notify</code> posts an Android notification, and <code>podroid-forward</code> creates or removes port-forward rules without leaving the shell. The app posts the notification or writes the rule on the host side. See <a href="networking.html">Networking &amp; ports</a> for usage.</p>
 
       <h2>Boot stages</h2>
       <p>The app watches the VM's serial console and updates the persistent notification as each stage marker appears. You can follow along in real time during the first boot, where host-key generation adds a visible pause between "Starting SSH..." and the next stage.</p>
@@ -123,6 +126,10 @@
           <tr>
             <td>QEMU / AVF</td>
             <td>Hypervisor backend; QEMU (software TCG) works on any device, AVF (hardware) on supported Pixels</td>
+          </tr>
+          <tr>
+            <td>podroid-hostd</td>
+            <td>Guest-to-Android bridge daemon; relays <code>podroid-notify</code> and <code>podroid-forward</code> requests to the app over a virtio-console port (QEMU) or vsock (AVF)</td>
           </tr>
           <tr>
             <td>Foreground service</td>

@@ -168,6 +168,10 @@
             <td>AVF only. Starts the vsock port-forwarding agent that bridges Android-side TCP connections to guest vsock ports. On QEMU this service marks itself inactive and does nothing.</td>
           </tr>
           <tr>
+            <td><code>podroid-hostd</code></td>
+            <td>The guest-to-Android bridge daemon (both backends). Listens on a guest-local Unix socket and relays requests from the <code>podroid-notify</code> and <code>podroid-forward</code> CLIs to the Android app over its control transport (a virtio-console port on QEMU, vsock on AVF), which posts the notification or writes the port-forward rule. See <a href="networking.html">Networking &amp; ports</a>.</td>
+          </tr>
+          <tr>
             <td><code>podroid-ready</code></td>
             <td>Runs last (after all other services). Emits the boot-stage markers (<code>Starting SSH...</code>, <code>Almost ready...</code>, <code>Ready!</code>) that the Android app watches to detect a successful boot. Also sets OOM scores on infrastructure processes so the kernel reaps user apps before killing the VM.</td>
           </tr>
