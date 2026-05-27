@@ -451,7 +451,15 @@ class PodroidService : Service() {
     private fun handlePowerRequest(action: String): String {
         val proto = com.excp.podroid.engine.hostbridge.HostProtocol
         return when (action) {
-            "status" -> proto.ok(engine.state.value.javaClass.simpleName)
+            // Map explicitly, not via javaClass.simpleName: R8 obfuscates class
+            // names in release builds, so simpleName returns garbage like "wc2".
+            "status" -> proto.ok(when (engine.state.value) {
+                is VmState.Idle -> "idle"
+                is VmState.Starting -> "starting"
+                is VmState.Running -> "running"
+                is VmState.Stopped -> "stopped"
+                is VmState.Error -> "error"
+            })
             "stop" -> {
                 val ctx = applicationContext
                 android.os.Handler(android.os.Looper.getMainLooper())
