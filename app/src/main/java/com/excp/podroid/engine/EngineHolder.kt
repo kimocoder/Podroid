@@ -215,6 +215,7 @@ class EngineHolder @Inject constructor(
             probe.managePermissionGranted &&
             probe.customPermissionGranted &&
             probe.serviceReachable &&
+            probe.customVmConfigSupported &&
             capsChoice !is AvfCapabilities.ProtectedVmChoice.Unsupported
         return when {
             sel == EngineSelection.QEMU -> qemuProvider.get()
@@ -234,6 +235,7 @@ class EngineHolder @Inject constructor(
                             "feature=${probe.featureSupported} " +
                             "perms=${probe.managePermissionGranted}/${probe.customPermissionGranted} " +
                             "reachable=${probe.serviceReachable} " +
+                            "customVm=${probe.customVmConfigSupported} " +
                             "caps=${probe.capabilitiesRaw}(${probe.capabilitiesDecoded})"
                     )
                 }
@@ -247,6 +249,7 @@ class EngineHolder @Inject constructor(
                 TAG,
                 "pick: selection=$sel feature=${probe.featureSupported} " +
                     "perms=${probe.managePermissionGranted}/${probe.customPermissionGranted} " +
+                    "customVm=${probe.customVmConfigSupported} " +
                     "caps=${probe.capabilitiesRaw}(${probe.capabilitiesDecoded}) → ${it.backendId}"
             )
         }
