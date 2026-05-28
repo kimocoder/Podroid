@@ -335,13 +335,13 @@ fun SettingsScreen(
                 PodroidListRow(label = stringResource(R.string.qemu_label), value = "v${BuildConfig.QEMU_VERSION}", mono = true)
                 PodroidListRow(label = stringResource(R.string.architecture), value = "AArch64", mono = true)
                 PodroidListRow(label = stringResource(R.string.linux_distro), value = "Alpine 3.23", mono = true)
+                Spacer(Modifier.height(PodroidTokens.Spacing.MD))
                 val uriHandler = LocalUriHandler.current
-                PodroidListRow(
-                    label = stringResource(R.string.documentation),
-                    value = "extv.github.io/Podroid",
+                PodroidGhostButton(
+                    text = stringResource(R.string.documentation),
                     onClick = { uriHandler.openUri("https://extv.github.io/Podroid/guide/") },
                 )
-                Spacer(Modifier.height(PodroidTokens.Spacing.MD))
+                Spacer(Modifier.height(PodroidTokens.Spacing.SM))
                 PodroidGhostButton(
                     text = stringResource(R.string.export_diagnostic_log),
                     onClick = { viewModel.exportConsoleLogs() },
