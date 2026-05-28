@@ -127,6 +127,35 @@ class HomeViewModel @Inject constructor(
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 
+    /** True when AVF was the active backend and the VM ended in Error
+     *  (boot failure / crash). Drives the actionable failure surface. */
+    val avfBootFailure: StateFlow<Boolean> = vmState
+        .map { it is VmState.Error && engine.backendId == "avf" }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    /** Advice for the failure surface, based on the current vCPU setting. */
+    val avfFailureAdvice: StateFlow<com.excp.podroid.engine.avf.AvfFailureGuidance.Advice> =
+        settingsRepository.vmCpus
+            .map { com.excp.podroid.engine.avf.AvfFailureGuidance.advise(it) }
+            .stateIn(
+                viewModelScope, SharingStarted.Eagerly,
+                com.excp.podroid.engine.avf.AvfFailureGuidance.Advice.SWITCH_TO_QEMU,
+            )
+
+    fun useOneCoreAndRetry() {
+        viewModelScope.launch {
+            settingsRepository.setVmCpus(1)
+            restartVm()
+        }
+    }
+
+    fun switchToQemuAndRetry() {
+        viewModelScope.launch {
+            settingsRepository.setEngineSelection(com.excp.podroid.engine.EngineSelection.QEMU)
+            restartVm()
+        }
+    }
+
     // Fallback timestamp stamped the first time we observe Running, used when the
     // engine doesn't supply runningSinceMs (e.g. a future engine that omits the override).
     private var fallbackRunningSinceMs: Long? = null
