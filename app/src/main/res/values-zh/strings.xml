@@ -220,4 +220,11 @@
     <string name="server_mode_desc">在屏幕变黑的情况下保持虚拟机运行以省电。应用会保持在前台，因此虚拟机不会被停止。要退出，请在任意位置长按 3 秒。</string>
     <string name="server_mode_enable">启用服务器模式</string>
     <string name="server_mode_exit_hint">长按 3 秒退出</string>
+
+    <!-- AVF Boot Failure -->
+    <string name="avf_boot_failed_try_one_core">AVF 在此设备上启动失败。请尝试将 CPU 核心数设置为 1，或将后端切换至 QEMU。</string>
+    <string name="avf_boot_failed_switch_qemu">AVF 在此设备上无法启动。请将后端切换至 QEMU。</string>
+    <string name="avf_action_use_one_core">使用 1 个核心</string>
+    <string name="avf_action_switch_qemu">切换至 QEMU</string>
+    <string name="avf_action_retry">重试</string>
 </resources>

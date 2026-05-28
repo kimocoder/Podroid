@@ -219,4 +219,11 @@
     <string name="server_mode_desc">Keeps the VM running with the screen blacked out to save power. The app stays in the foreground so the VM is never stopped. To exit, press and hold anywhere for 3 seconds.</string>
     <string name="server_mode_enable">Enable server mode</string>
     <string name="server_mode_exit_hint">Hold 3 seconds to exit</string>
+
+    <!-- AVF Boot Failure -->
+    <string name="avf_boot_failed_try_one_core">AVF failed to boot on this device. Try setting CPU cores to 1, or switch the backend to QEMU.</string>
+    <string name="avf_boot_failed_switch_qemu">AVF couldn\'t boot on this device. Switch the backend to QEMU.</string>
+    <string name="avf_action_use_one_core">Use 1 core</string>
+    <string name="avf_action_switch_qemu">Switch to QEMU</string>
+    <string name="avf_action_retry">Retry</string>
 </resources>
