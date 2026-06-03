@@ -29,6 +29,7 @@ package com.excp.podroid.x11
 
 import java.io.DataInputStream
 import java.io.IOException
+import java.util.Arrays
 import java.util.zip.Inflater
 
 class ZrleDecoder {
@@ -43,9 +44,7 @@ class ZrleDecoder {
     }
 
     // Scratch buffer for compressed input read from the socket.
-    private var inputScratch = ByteArray(4096)
-    // Decompressed output buffer; re-used across inflate calls within one decode() call.
-    private var outputBuf = ByteArray(4096)
+    private var inputScratch = ByteArray(16384)
 
     // Remaining compressed bytes in the current rect that have not yet been fed to the inflater.
     private var remaining = 0
@@ -117,9 +116,7 @@ class ZrleDecoder {
                 // Raw: tw*th CPIXELs.
                 for (row in 0 until th) {
                     val base = (ty + row) * stride + tx
-                    for (col in 0 until tw) {
-                        target[base + col] = zi.readCpixel()
-                    }
+                    zi.readCpixels(target, base, tw)
                 }
             }
             subenc == 1 -> {
@@ -127,7 +124,7 @@ class ZrleDecoder {
                 val color = zi.readCpixel()
                 for (row in 0 until th) {
                     val base = (ty + row) * stride + tx
-                    for (col in 0 until tw) target[base + col] = color
+                    Arrays.fill(target, base, base + tw, color)
                 }
             }
             subenc in 2..16 -> {
@@ -167,16 +164,24 @@ class ZrleDecoder {
                 // Plain RLE: sequence of runs until tile is full.
                 val total = tw * th
                 var filled = 0
+                var r = 0; var c = 0
                 while (filled < total) {
                     val color = zi.readCpixel()
                     val runLen = zi.readRunLength()
-                    if (filled + runLen > total) throw IOException("ZRLE: plain RLE run overruns tile ($filled+$runLen > $total)")
-                    repeat(runLen) {
-                        val pos = filled + it
-                        val row = pos / tw; val col = pos % tw
-                        target[(ty + row) * stride + (tx + col)] = color
+                    if (filled + runLen > total) throw IOException("ZRLE: plain RLE run overruns tile")
+
+                    var remaining = runLen
+                    while (remaining > 0) {
+                        val chunk = minOf(remaining, tw - c)
+                        val base = (ty + r) * stride + (tx + c)
+                        if (chunk == 1) target[base] = color
+                        else Arrays.fill(target, base, base + chunk, color)
+
+                        remaining -= chunk
+                        filled += chunk
+                        c += chunk
+                        if (c == tw) { c = 0; r++ }
                     }
-                    filled += runLen
                 }
             }
             subenc in 130..255 -> {
@@ -185,28 +190,27 @@ class ZrleDecoder {
                 val palette = IntArray(n) { zi.readCpixel() }
                 val total = tw * th
                 var filled = 0
+                var r = 0; var c = 0
                 while (filled < total) {
-                    val indexByte = zi.readByte()
-                    if (indexByte and 0x80 == 0) {
-                        // Single pixel.
-                        if (indexByte >= n) throw IOException("ZRLE: palette RLE index $indexByte >= $n")
-                        val pos = filled
-                        val row = pos / tw; val col = pos % tw
-                        target[(ty + row) * stride + (tx + col)] = palette[indexByte]
-                        filled++
-                    } else {
-                        // Run of palette[index & 0x7F].
-                        val idx = indexByte and 0x7F
-                        if (idx >= n) throw IOException("ZRLE: palette RLE index $idx >= $n")
-                        val color = palette[idx]
-                        val runLen = zi.readRunLength()
-                        if (filled + runLen > total) throw IOException("ZRLE: palette RLE run overruns tile ($filled+$runLen > $total)")
-                        repeat(runLen) {
-                            val pos = filled + it
-                            val row = pos / tw; val col = pos % tw
-                            target[(ty + row) * stride + (tx + col)] = color
-                        }
-                        filled += runLen
+                    val b = zi.readByte()
+                    val idx = b and 0x7F
+                    if (idx >= n) throw IOException("ZRLE: palette RLE index $idx >= $n")
+                    val color = palette[idx]
+
+                    val runLen = if (b and 0x80 == 0) 1 else zi.readRunLength()
+                    if (filled + runLen > total) throw IOException("ZRLE: palette RLE run overruns tile")
+
+                    var remaining = runLen
+                    while (remaining > 0) {
+                        val chunk = minOf(remaining, tw - c)
+                        val base = (ty + r) * stride + (tx + c)
+                        if (chunk == 1) target[base] = color
+                        else Arrays.fill(target, base, base + chunk, color)
+
+                        remaining -= chunk
+                        filled += chunk
+                        c += chunk
+                        if (c == tw) { c = 0; r++ }
                     }
                 }
             }
@@ -219,7 +223,7 @@ class ZrleDecoder {
      * The inflater's input was already loaded by [decode]; this just drains output.
      */
     private inner class ZInput(private val inf: Inflater) {
-        private val buf = ByteArray(256)
+        private val buf = ByteArray(16384)
         private var pos = 0
         private var avail = 0
 
@@ -257,6 +261,22 @@ class ZrleDecoder {
             val g = readByte()
             val r = readByte()
             return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+        }
+
+        /** Bulk read n CPIXELs into [target] starting at [offset]. */
+        fun readCpixels(target: IntArray, offset: Int, n: Int) {
+            for (i in 0 until n) {
+                // Inline 3x readByte to avoid method call overhead in the raw path.
+                if (avail < 3) {
+                    target[offset + i] = readCpixel()
+                } else {
+                    val b = buf[pos++].toInt() and 0xFF
+                    val g = buf[pos++].toInt() and 0xFF
+                    val r = buf[pos++].toInt() and 0xFF
+                    avail -= 3
+                    target[offset + i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                }
+            }
         }
 
         /**

@@ -102,8 +102,8 @@ object VncClient {
 
     /**
      * Sends SetPixelFormat to lock the server to 32-bit BGRA, then SetEncodings
-     * to advertise Raw + CopyRect. Call once after handshake before requesting
-     * any framebuffer update.
+     * to advertise ZRLE + CopyRect + Raw. Call once after handshake before
+     * requesting any framebuffer update.
      */
     fun negotiatePixelFormat(out: OutputStream) {
         // SetPixelFormat (msg=0): pad[3] + 16-byte PixelFormat
@@ -116,15 +116,12 @@ object VncClient {
         )
         out.write(pf)
 
-        // SetEncodings (msg=2): CopyRect, Raw, ExtendedDesktopSize(-308).
-        // ZRLE is still NOT advertised, but the historical desync cause is now
-        // fixed: ZrleDecoder fed the inflater in chunks without draining, dropping
-        // all but the last 4 KB of any block >4096 bytes ("invalid distance code").
-        // It now feeds on demand and bounds-checks palette indices and run lengths.
-        // Re-enabling ZRLE changes what the server streams, so it stays gated until
-        // validated on-device against real Firefox/xfce tiles (a separate change).
-        val se = java.nio.ByteBuffer.allocate(4 + 3 * 4)
-        se.put(2.toByte()); se.put(0.toByte()); se.putShort(3)
+        // SetEncodings (msg=2): ZRLE, CopyRect, Raw, ExtendedDesktopSize(-308).
+        // ZRLE is prioritized (advertised first) as it offers the best balance of
+        // compression and CPU usage for this environment.
+        val se = java.nio.ByteBuffer.allocate(4 + 4 * 4)
+        se.put(2.toByte()); se.put(0.toByte()); se.putShort(4)
+        se.putInt(16)     // ZRLE
         se.putInt(1)      // CopyRect
         se.putInt(0)      // Raw
         se.putInt(-308)   // ExtendedDesktopSize
