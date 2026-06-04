@@ -1,0 +1,3 @@
+## 2025-01-24 - [ZRLE Decoding Optimization]
+**Learning:** In Android's JVM, JNI overhead for `Inflater.inflate()` calls is a significant bottleneck. Standard 4KB or smaller buffers (like the 256B buffer previously used) cause excessive context switching between managed and native code. Additionally, coordinate arithmetic (division/modulo) in tight pixel loops for image decoding adds unnecessary CPU overhead that can be avoided with incremental counters and `Arrays.fill()`.
+**Action:** Always prefer at least 16KB buffers for `Inflater` and use incremental row/column counters with bulk array operations (`System.arraycopy` or `Arrays.fill`) for pixel manipulation in hot paths.
