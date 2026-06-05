@@ -1,0 +1,3 @@
+## 2025-01-24 - [ZRLE Decoder Optimization]
+**Learning:** JNI transition overhead for Inflater operations in Android is significant. Small buffer sizes (e.g. 256B or 4KB) lead to frequent transitions that throttle throughput. Additionally, integer division and modulo in tight pixel loops for RLE decoding are expensive compared to incremental scanline counters and bulk operations like `Arrays.fill`.
+**Action:** Always prefer 16KB+ buffers for JNI-backed streaming (zlib, crypto). Replace coordinate-based pixel addressing with incremental pointers or counters, and leverage native bulk array operations whenever possible.
