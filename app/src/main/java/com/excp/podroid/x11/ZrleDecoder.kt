@@ -43,9 +43,7 @@ class ZrleDecoder {
     }
 
     // Scratch buffer for compressed input read from the socket.
-    private var inputScratch = ByteArray(4096)
-    // Decompressed output buffer; re-used across inflate calls within one decode() call.
-    private var outputBuf = ByteArray(4096)
+    private var inputScratch = ByteArray(16384)
 
     // Remaining compressed bytes in the current rect that have not yet been fed to the inflater.
     private var remaining = 0
@@ -127,7 +125,7 @@ class ZrleDecoder {
                 val color = zi.readCpixel()
                 for (row in 0 until th) {
                     val base = (ty + row) * stride + tx
-                    for (col in 0 until tw) target[base + col] = color
+                    java.util.Arrays.fill(target, base, base + tw, color)
                 }
             }
             subenc in 2..16 -> {
@@ -167,14 +165,26 @@ class ZrleDecoder {
                 // Plain RLE: sequence of runs until tile is full.
                 val total = tw * th
                 var filled = 0
+                var curRow = 0
+                var curCol = 0
                 while (filled < total) {
                     val color = zi.readCpixel()
                     val runLen = zi.readRunLength()
                     if (filled + runLen > total) throw IOException("ZRLE: plain RLE run overruns tile ($filled+$runLen > $total)")
-                    repeat(runLen) {
-                        val pos = filled + it
-                        val row = pos / tw; val col = pos % tw
-                        target[(ty + row) * stride + (tx + col)] = color
+
+                    var remainingRun = runLen
+                    while (remainingRun > 0) {
+                        val canFillInRow = tw - curCol
+                        val toFill = minOf(remainingRun, canFillInRow)
+                        val base = (ty + curRow) * stride + (tx + curCol)
+                        java.util.Arrays.fill(target, base, base + toFill, color)
+
+                        remainingRun -= toFill
+                        curCol += toFill
+                        if (curCol == tw) {
+                            curCol = 0
+                            curRow++
+                        }
                     }
                     filled += runLen
                 }
@@ -185,14 +195,19 @@ class ZrleDecoder {
                 val palette = IntArray(n) { zi.readCpixel() }
                 val total = tw * th
                 var filled = 0
+                var curRow = 0
+                var curCol = 0
                 while (filled < total) {
                     val indexByte = zi.readByte()
                     if (indexByte and 0x80 == 0) {
                         // Single pixel.
                         if (indexByte >= n) throw IOException("ZRLE: palette RLE index $indexByte >= $n")
-                        val pos = filled
-                        val row = pos / tw; val col = pos % tw
-                        target[(ty + row) * stride + (tx + col)] = palette[indexByte]
+                        target[(ty + curRow) * stride + (tx + curCol)] = palette[indexByte]
+                        curCol++
+                        if (curCol == tw) {
+                            curCol = 0
+                            curRow++
+                        }
                         filled++
                     } else {
                         // Run of palette[index & 0x7F].
@@ -201,10 +216,20 @@ class ZrleDecoder {
                         val color = palette[idx]
                         val runLen = zi.readRunLength()
                         if (filled + runLen > total) throw IOException("ZRLE: palette RLE run overruns tile ($filled+$runLen > $total)")
-                        repeat(runLen) {
-                            val pos = filled + it
-                            val row = pos / tw; val col = pos % tw
-                            target[(ty + row) * stride + (tx + col)] = color
+
+                        var remainingRun = runLen
+                        while (remainingRun > 0) {
+                            val canFillInRow = tw - curCol
+                            val toFill = minOf(remainingRun, canFillInRow)
+                            val base = (ty + curRow) * stride + (tx + curCol)
+                            java.util.Arrays.fill(target, base, base + toFill, color)
+
+                            remainingRun -= toFill
+                            curCol += toFill
+                            if (curCol == tw) {
+                                curCol = 0
+                                curRow++
+                            }
                         }
                         filled += runLen
                     }
@@ -219,7 +244,7 @@ class ZrleDecoder {
      * The inflater's input was already loaded by [decode]; this just drains output.
      */
     private inner class ZInput(private val inf: Inflater) {
-        private val buf = ByteArray(256)
+        private val buf = ByteArray(16384)
         private var pos = 0
         private var avail = 0
 
@@ -236,26 +261,40 @@ class ZrleDecoder {
                     remaining -= nIn
                 }
                 val n = inf.inflate(buf)
-                if (n > 0) { pos = 0; avail = n }
-                // n == 0 with needsInput means all input was consumed; if finished() is false
-                // but no output and needsInput, the caller overfed or the stream is malformed.
-                else if (inf.needsInput()) throw IOException("ZRLE: inflater needs more input but none queued")
-                // n == 0, not finished, not needsInput → needsDictionary or a stuck
-                // stream: bail rather than spin forever.
-                else throw IOException("ZRLE: inflater made no progress")
+                if (n > 0) {
+                    pos = 0
+                    avail = n
+                } else if (inf.needsInput()) {
+                    // n == 0 with needsInput means all input was consumed; if finished() is false
+                    // but no output and needsInput, the caller overfed or the stream is malformed.
+                    throw IOException("ZRLE: inflater needs more input but none queued")
+                } else {
+                    // n == 0, not finished, not needsInput → needsDictionary or a stuck
+                    // stream: bail rather than spin forever.
+                    throw IOException("ZRLE: inflater made no progress")
+                }
             }
         }
 
         fun readByte(): Int {
-            fill()
-            return buf[pos++].toInt().also { avail-- } and 0xFF
+            if (avail <= 0) fill()
+            val b = buf[pos++].toInt() and 0xFF
+            avail--
+            return b
         }
 
         /** Read 3-byte CPIXEL (B, G, R) and return as ARGB int. */
         fun readCpixel(): Int {
-            val b = readByte()
-            val g = readByte()
-            val r = readByte()
+            if (avail < 3) {
+                val b = readByte()
+                val g = readByte()
+                val r = readByte()
+                return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+            }
+            val b = buf[pos++].toInt() and 0xFF
+            val g = buf[pos++].toInt() and 0xFF
+            val r = buf[pos++].toInt() and 0xFF
+            avail -= 3
             return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
         }
 
