@@ -1,0 +1,3 @@
+## 2026-06-06 - [Optimized ZRLE Decoding for VNC/X11]
+**Learning:** JNI transition overhead for small buffers (256B) and coordinate arithmetic (division/modulo) inside tight pixel loops are major performance bottlenecks in Android VNC decoders. Using 16KB buffers aligns with memory recommendations and significantly reduces JNI calls. Native bulk operations like `java.util.Arrays.fill` are much faster than manual loops for filling spans of identical pixels.
+**Action:** Always use scanline-based incremental counters instead of `/tw` and `%tw` in tile-based decoders. Ensure decompression buffers are at least 16KB.
