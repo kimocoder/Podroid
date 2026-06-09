@@ -29,6 +29,7 @@ package com.excp.podroid.x11
 
 import java.io.DataInputStream
 import java.io.IOException
+import java.util.Arrays
 import java.util.zip.Inflater
 
 class ZrleDecoder {
@@ -43,9 +44,8 @@ class ZrleDecoder {
     }
 
     // Scratch buffer for compressed input read from the socket.
-    private var inputScratch = ByteArray(4096)
-    // Decompressed output buffer; re-used across inflate calls within one decode() call.
-    private var outputBuf = ByteArray(4096)
+    // 16KB matches the zlib decompression buffer size for optimal JNI transitions.
+    private var inputScratch = ByteArray(16384)
 
     // Remaining compressed bytes in the current rect that have not yet been fed to the inflater.
     private var remaining = 0
@@ -93,7 +93,7 @@ class ZrleDecoder {
         remaining = compLen
         inputStream = din
 
-        // Wrap the inflater so tile-level code just calls readByte()/readBytes().
+        // Wrap the inflater so tile-level code just calls readByte()/readCpixel().
         val zi = ZInput(inflater)
 
         // Tile loop: 64x64 tiles in row-major order.
@@ -123,11 +123,11 @@ class ZrleDecoder {
                 }
             }
             subenc == 1 -> {
-                // Solid: 1 CPIXEL, fill the whole tile.
+                // Solid: 1 CPIXEL, fill the whole tile using native bulk fill.
                 val color = zi.readCpixel()
                 for (row in 0 until th) {
                     val base = (ty + row) * stride + tx
-                    for (col in 0 until tw) target[base + col] = color
+                    Arrays.fill(target, base, base + tw, color)
                 }
             }
             subenc in 2..16 -> {
@@ -165,48 +165,58 @@ class ZrleDecoder {
             }
             subenc == 128 -> {
                 // Plain RLE: sequence of runs until tile is full.
+                // Replaces div/mod with incremental counters.
                 val total = tw * th
                 var filled = 0
+                var currY = 0
+                var currX = 0
                 while (filled < total) {
                     val color = zi.readCpixel()
-                    val runLen = zi.readRunLength()
+                    var runLen = zi.readRunLength()
                     if (filled + runLen > total) throw IOException("ZRLE: plain RLE run overruns tile ($filled+$runLen > $total)")
-                    repeat(runLen) {
-                        val pos = filled + it
-                        val row = pos / tw; val col = pos % tw
-                        target[(ty + row) * stride + (tx + col)] = color
-                    }
                     filled += runLen
+                    while (runLen > 0) {
+                        val n = minOf(runLen, tw - currX)
+                        val base = (ty + currY) * stride + (tx + currX)
+                        if (n == 1) target[base] = color else Arrays.fill(target, base, base + n, color)
+                        currX += n
+                        if (currX == tw) { currX = 0; currY++ }
+                        runLen -= n
+                    }
                 }
             }
             subenc in 130..255 -> {
-                // Palette RLE.
+                // Palette RLE: Replaces div/mod with incremental counters.
                 val n = subenc - 128
                 val palette = IntArray(n) { zi.readCpixel() }
                 val total = tw * th
                 var filled = 0
+                var currY = 0
+                var currX = 0
                 while (filled < total) {
                     val indexByte = zi.readByte()
                     if (indexByte and 0x80 == 0) {
                         // Single pixel.
                         if (indexByte >= n) throw IOException("ZRLE: palette RLE index $indexByte >= $n")
-                        val pos = filled
-                        val row = pos / tw; val col = pos % tw
-                        target[(ty + row) * stride + (tx + col)] = palette[indexByte]
+                        target[(ty + currY) * stride + (tx + currX)] = palette[indexByte]
                         filled++
+                        if (++currX == tw) { currX = 0; currY++ }
                     } else {
                         // Run of palette[index & 0x7F].
                         val idx = indexByte and 0x7F
                         if (idx >= n) throw IOException("ZRLE: palette RLE index $idx >= $n")
                         val color = palette[idx]
-                        val runLen = zi.readRunLength()
+                        var runLen = zi.readRunLength()
                         if (filled + runLen > total) throw IOException("ZRLE: palette RLE run overruns tile ($filled+$runLen > $total)")
-                        repeat(runLen) {
-                            val pos = filled + it
-                            val row = pos / tw; val col = pos % tw
-                            target[(ty + row) * stride + (tx + col)] = color
-                        }
                         filled += runLen
+                        while (runLen > 0) {
+                            val chunk = minOf(runLen, tw - currX)
+                            val base = (ty + currY) * stride + (tx + currX)
+                            if (chunk == 1) target[base] = color else Arrays.fill(target, base, base + chunk, color)
+                            currX += chunk
+                            if (currX == tw) { currX = 0; currY++ }
+                            runLen -= chunk
+                        }
                     }
                 }
             }
@@ -219,7 +229,8 @@ class ZrleDecoder {
      * The inflater's input was already loaded by [decode]; this just drains output.
      */
     private inner class ZInput(private val inf: Inflater) {
-        private val buf = ByteArray(256)
+        // 16KB minimizes JNI transitions during inflation.
+        private val buf = ByteArray(16384)
         private var pos = 0
         private var avail = 0
 
@@ -235,24 +246,39 @@ class ZrleDecoder {
                     inf.setInput(inputScratch, 0, nIn)
                     remaining -= nIn
                 }
-                val n = inf.inflate(buf)
-                if (n > 0) { pos = 0; avail = n }
-                // n == 0 with needsInput means all input was consumed; if finished() is false
-                // but no output and needsInput, the caller overfed or the stream is malformed.
-                else if (inf.needsInput()) throw IOException("ZRLE: inflater needs more input but none queued")
-                // n == 0, not finished, not needsInput → needsDictionary or a stuck
-                // stream: bail rather than spin forever.
-                else throw IOException("ZRLE: inflater made no progress")
+                val n = try {
+                    inf.inflate(buf)
+                } catch (e: Exception) {
+                    throw IOException("ZRLE: inflation failed", e)
+                }
+                if (n > 0) {
+                    pos = 0
+                    avail = n
+                } else if (inf.needsInput()) {
+                    if (remaining == 0) throw IOException("ZRLE: inflater needs more input but none left")
+                } else {
+                    throw IOException("ZRLE: inflater made no progress")
+                }
             }
         }
 
         fun readByte(): Int {
-            fill()
-            return buf[pos++].toInt().also { avail-- } and 0xFF
+            if (avail == 0) fill()
+            val b = buf[pos++].toInt() and 0xFF
+            avail--
+            return b
         }
 
         /** Read 3-byte CPIXEL (B, G, R) and return as ARGB int. */
         fun readCpixel(): Int {
+            // Hot path: optimized to read all 3 bytes with one fill() check if possible.
+            if (avail >= 3) {
+                val b = buf[pos++].toInt() and 0xFF
+                val g = buf[pos++].toInt() and 0xFF
+                val r = buf[pos++].toInt() and 0xFF
+                avail -= 3
+                return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+            }
             val b = readByte()
             val g = readByte()
             val r = readByte()
