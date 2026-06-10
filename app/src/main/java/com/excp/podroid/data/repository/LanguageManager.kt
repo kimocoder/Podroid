@@ -33,7 +33,11 @@ class LanguageManager @Inject constructor(
         fun getSavedLanguage(ctx: Context): String {
             return try {
                 val file = File(ctx.filesDir, LANG_CACHE_FILE)
-                if (file.exists()) file.readText().trim() else LANGUAGE_AUTO
+                // Clamp to a known value so a partially-written or stale cache
+                // can't feed an unrecognized locale into attachBaseContext; an
+                // unknown value means "follow the system" exactly like the flow.
+                val raw = if (file.exists()) file.readText().trim() else LANGUAGE_AUTO
+                if (raw == LANGUAGE_ZH || raw == LANGUAGE_EN) raw else LANGUAGE_AUTO
             } catch (_: Exception) {
                 LANGUAGE_AUTO
             }
@@ -46,7 +50,11 @@ class LanguageManager @Inject constructor(
         fun persistLanguage(ctx: Context, language: String) {
             try {
                 File(ctx.filesDir, LANG_CACHE_FILE).writeText(language)
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                // Log rather than swallow: a failed write leaves the next cold
+                // start showing the old language while DataStore disagrees.
+                android.util.Log.w("LanguageManager", "failed to persist language cache", e)
+            }
         }
 
         /**
