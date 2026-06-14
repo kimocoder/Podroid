@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.Settings
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts.RequestPermission
 import androidx.compose.animation.core.animateDpAsState
@@ -110,6 +111,13 @@ fun SetupScreen(
             }
             onSetupComplete()
         }
+    }
+
+    // System back steps the wizard back one page instead of exiting the app
+    // (setup is the start destination, so an unhandled back would finish the
+    // Activity mid-wizard). Disabled on page 0 so back there behaves normally.
+    BackHandler(enabled = pagerState.currentPage > 0) {
+        scope.launch { pagerState.animateScrollToPage(pagerState.currentPage - 1) }
     }
 
     // Re-sync storageAccessEnabled against the actual OS grant on every
@@ -402,8 +410,21 @@ private fun StorageAccessPage(
     onBack: () -> Unit,
     onNext: () -> Unit,
 ) {
+    val context = LocalContext.current
     val canManageAllFiles = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
-    val hasStoragePermission = !canManageAllFiles || Environment.isExternalStorageManager()
+    var hasStoragePermission by remember {
+        mutableStateOf(
+            when {
+                canManageAllFiles -> Environment.isExternalStorageManager()
+                else -> ContextCompat.checkSelfPermission(
+                    context, Manifest.permission.WRITE_EXTERNAL_STORAGE
+                ) == PackageManager.PERMISSION_GRANTED
+            }
+        )
+    }
+    val writeStoragePermLauncher = rememberLauncherForActivityResult(RequestPermission()) { granted ->
+        hasStoragePermission = granted
+    }
 
     SetupPageLayout(
         windowSizeClass = windowSizeClass,
@@ -425,9 +446,16 @@ private fun StorageAccessPage(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        if (storageAccessEnabled && canManageAllFiles && !hasStoragePermission) {
+        if (storageAccessEnabled && !hasStoragePermission) {
             Spacer(Modifier.height(PodroidTokens.Spacing.LG))
-            PodroidPrimaryButton(text = stringResource(R.string.grant_storage_access), onClick = onOpenStorageAccessSettings)
+            if (canManageAllFiles) {
+                PodroidPrimaryButton(text = stringResource(R.string.grant_storage_access), onClick = onOpenStorageAccessSettings)
+            } else {
+                PodroidPrimaryButton(
+                    text = stringResource(R.string.grant_storage_access),
+                    onClick = { writeStoragePermLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE) },
+                )
+            }
         }
         Spacer(Modifier.height(PodroidTokens.Spacing.LG))
         Text(

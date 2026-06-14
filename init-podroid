@@ -4,9 +4,31 @@
 # on the Alpine squashfs.
 set -e
 
-mount -t proc    proc      /proc  -o noexec,nosuid,nodev
-mount -t sysfs   sys       /sys   -o noexec,nosuid,nodev
-mount -t devtmpfs devtmpfs /dev   -o exec,nosuid,mode=0755,size=2M
+# Ensure mount points exist (defensive: cpio packing can omit empty dirs).
+mkdir -p /proc /sys /dev /run
+
+echo "[podroid-init] mounting virtual filesystems" > /dev/console
+
+# Place -o BEFORE the device and mountpoint arguments.
+# util-linux's getopt stops processing options at the first non-option
+# argument when POSIXLY_CORRECT is set; options placed after the mountpoint
+# are then treated as extra positional args, not flags, which can result in
+# the mount(2) syscall being called with flags=0 and returning EPERM,
+# producing "must be superuser to use mount" even for root.
+mount -t proc    -o noexec,nosuid,nodev     proc      /proc
+echo "[podroid-init] mounted /proc" > /dev/console
+mount -t sysfs   -o noexec,nosuid,nodev     sysfs     /sys
+echo "[podroid-init] mounted /sys" > /dev/console
+
+# CONFIG_DEVTMPFS_MOUNT=y causes the kernel to pre-mount devtmpfs at /dev
+# before executing /init.  A second mount(2) there can return EBUSY, and
+# size= is not a valid option for devtmpfs in kernels where it is backed by
+# ramfs rather than tmpfs, causing EINVAL.  Either failure exits util-linux
+# with MNT_EX_FAIL=32; set -e then propagates exit(32), which the kernel
+# encodes as exitcode=0x00002000 ("Attempted to kill init!").
+# The kernel's pre-populated /dev is sufficient; || true makes this non-fatal.
+mount -t devtmpfs -o exec,nosuid,mode=0755  devtmpfs  /dev || true
+echo "[podroid-init] mounted /dev (or reused kernel pre-mount)" > /dev/console
 
 echo "Mounting storage..." > /dev/console
 
@@ -90,4 +112,5 @@ mount --move /sys  /mnt/overlay/sys \
 mount --move /dev  /mnt/overlay/dev \
     || { echo "FATAL: mount --move /dev failed" > /dev/console; exec sh; }
 
+echo "[podroid-init] switching to real root" > /dev/console
 exec /sbin/switch_root /mnt/overlay /sbin/init

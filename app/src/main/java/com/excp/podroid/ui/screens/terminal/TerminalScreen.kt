@@ -99,6 +99,10 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -209,7 +213,7 @@ fun TerminalScreen(
                 }
                 Spacer(Modifier.width(PodroidTokens.Spacing.XS))
                 IconButton(onClick = onNavigateToX11) {
-                    Icon(Icons.Default.DesktopWindows, contentDescription = "X11 screen")
+                    Icon(Icons.Default.DesktopWindows, contentDescription = stringResource(R.string.x11_open))
                 }
                 Spacer(Modifier.width(PodroidTokens.Spacing.XS))
                 IconButton(onClick = { viewModel.openQuickSettings() }) {
@@ -417,6 +421,26 @@ private fun TerminalSurface(
             onDispose { viewModel.bindView(null) }
         }
 
+        // Dead-session auto-reconnect: when the bridge dies while the VM stays
+        // Running, the ViewModel bumps reconnectSignal. Re-create the session and
+        // re-attach it to this same view so the user isn't stranded on a dead
+        // "[Process completed]" buffer. Skips the initial 0 (the DisposableEffect
+        // above owns the first attach).
+        val reconnectSignal by viewModel.reconnectSignal.collectAsStateWithLifecycle()
+        LaunchedEffect(view, reconnectSignal) {
+            if (reconnectSignal == 0) return@LaunchedEffect
+            viewModel.resetOnRestart()
+            viewModel.createSession()
+            val sess = viewModel.session ?: return@LaunchedEffect
+            view.mTermSession = sess
+            view.mEmulator = sess.emulator
+            view.onScreenUpdated()
+            view.post {
+                view.updateSize()
+                view.onScreenUpdated()
+            }
+        }
+
         // Pause the blinker when the activity is backgrounded. Without this
         // the Choreographer FrameCallback keeps firing every VSYNC in
         // paused-without-detach states (split-screen, dialog occlusion, PiP).
@@ -512,6 +536,7 @@ private fun ExtraKeysRow(
             KeyButton("\u2193", onKey, sendKey = "DOWN",  repeatable = true)
             KeyButton("\u2192", onKey, sendKey = "RIGHT", repeatable = true)
             KeyButton("ALT", onKey, isActive = altActive)
+            KeyButton("PASTE", onKey)
             KeyButton("-", onKey); KeyButton("/", onKey); KeyButton("|", onKey)
             KeyButton("HOME", onKey); KeyButton("END", onKey)
             KeyButton("PGUP", onKey); KeyButton("PGDN", onKey)
@@ -540,27 +565,35 @@ private fun KeyButton(
         }
     }
     val tapModifier = if (repeatable) {
-        Modifier.pointerInput(sendKey) {
-            awaitEachGesture {
-                awaitFirstDown(requireUnconsumed = false)
-                onKey(sendKey)
-                pressed = true
-                try { waitForUpOrCancellation() } finally { pressed = false }
+        // The raw pointerInput path is invisible to accessibility services; add
+        // button semantics + an onClick action so TalkBack can announce and
+        // activate repeatable keys (arrows) like the clickable ones.
+        Modifier
+            .semantics {
+                role = Role.Button
+                onClick(label = sendKey) { onKey(sendKey); true }
             }
-        }
+            .pointerInput(sendKey) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    onKey(sendKey)
+                    pressed = true
+                    try { waitForUpOrCancellation() } finally { pressed = false }
+                }
+            }
     } else {
-        Modifier.clickable { onKey(sendKey) }
+        Modifier.clickable(role = Role.Button) { onKey(sendKey) }
     }
     Text(
         text = label,
-        color = if (isActive) PodroidTokens.AccentInk else MaterialTheme.colorScheme.onSurface,
+        color = if (isActive) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
         fontSize = 13.sp,
         fontWeight = FontWeight.Medium,
         fontFamily = PodroidTokens.mono(),
         textAlign = TextAlign.Center,
         modifier = Modifier
             .clip(RoundedCornerShape(PodroidTokens.Radius.Chip))
-            .background(if (isActive) PodroidTokens.Accent else MaterialTheme.colorScheme.surfaceVariant)
+            .background(if (isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant)
             .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(PodroidTokens.Radius.Chip))
             .then(tapModifier)
             .padding(horizontal = 13.dp, vertical = 9.dp),
@@ -959,7 +992,7 @@ private fun AddSwatch(
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Text(label,
                 style = MaterialTheme.typography.labelLarge,
-                color = PodroidTokens.Accent,
+                color = MaterialTheme.colorScheme.primary,
                 fontWeight = FontWeight.SemiBold)
             Text(subLabel,
                 style = MaterialTheme.typography.labelSmall,
@@ -1141,7 +1174,7 @@ private fun SwatchBox(
             .then(clickModifier)
             .border(
                 width = if (selected) 2.dp else 1.dp,
-                color = if (selected) PodroidTokens.Accent else MaterialTheme.colorScheme.outline,
+                color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
                 shape = RoundedCornerShape(PodroidTokens.Radius.Card),
             )
             .padding(6.dp),

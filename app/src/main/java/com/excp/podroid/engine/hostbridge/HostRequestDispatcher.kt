@@ -22,7 +22,11 @@ class HostRequestDispatcher(
     private val validProtocols = setOf("tcp", "udp")
 
     suspend fun handle(line: String): String {
-        val parts = line.trim().split(" ")
+        // Split on runs of whitespace and drop empties so a double space (or a
+        // tab) between tokens doesn't shift the field count and fail an otherwise
+        // valid request.
+        val parts = line.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (parts.isEmpty()) return HostProtocol.err("bad request")
         return try {
             when (parts[0]) {
                 "NOTIFY" -> handleNotify(parts)
@@ -60,6 +64,10 @@ class HostRequestDispatcher(
         val guest = p[2].toIntOrNull() ?: return HostProtocol.err("bad guest port")
         val proto = p[3]
         if (host !in 1..65535 || guest !in 1..65535) return HostProtocol.err("port out of range")
+        // An unprivileged Android app lacks CAP_NET_BIND_SERVICE, so a host port
+        // below 1024 can never bind — accepting it would persist a rule that
+        // fails to apply on every diff and every boot while the guest CLI saw OK.
+        if (host < 1024) return HostProtocol.err("host port must be >= 1024 (Android apps can't bind privileged ports)")
         if (proto !in validProtocols) return HostProtocol.err("bad protocol")
         addForward(PortForwardRule(host, guest, proto))
         return HostProtocol.ok()

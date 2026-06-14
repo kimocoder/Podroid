@@ -92,6 +92,11 @@ class TerminalViewModel @Inject constructor(
     private val _showQuickSettings = kotlinx.coroutines.flow.MutableStateFlow(false)
     val showQuickSettings = _showQuickSettings
 
+    // Bumped when the session dies while the VM is still Running, so the screen
+    // re-creates and re-attaches a fresh session (dead-session auto-reconnect).
+    private val _reconnectSignal = kotlinx.coroutines.flow.MutableStateFlow(0)
+    val reconnectSignal: StateFlow<Int> = _reconnectSignal
+
     // Quick settings helpers (non-persistent)
     fun openQuickSettings() { _showQuickSettings.value = true }
     fun closeQuickSettings() { _showQuickSettings.value = false }
@@ -488,7 +493,16 @@ class TerminalViewModel @Inject constructor(
             viewRef?.get()?.onScreenUpdated()
         }
         override fun onTitleChanged(changedSession: TerminalSession) {}
-        override fun onSessionFinished(finishedSession: TerminalSession) {}
+        override fun onSessionFinished(finishedSession: TerminalSession) {
+            // Bridge/session died while the VM is still Running (a socket hiccup,
+            // a bridge crash) — not a VM shutdown. Signal the screen to drop the
+            // dead session and reconnect so the user isn't stranded on a
+            // "[Process completed]" buffer. On a real VM shutdown vmState is no
+            // longer Running, so we leave teardown to the normal path.
+            if (vmState.value is VmState.Running) {
+                _reconnectSignal.value += 1
+            }
+        }
         override fun onCopyTextToClipboard(session: TerminalSession, text: String?) {
             if (text == null) return
             val cb = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
@@ -525,7 +539,19 @@ class TerminalViewModel @Inject constructor(
     }
 
     val viewClient = object : TerminalViewClient {
-        override fun onScale(scale: Float): Float = scale
+        // Pinch-to-zoom → font size. TerminalView accumulates the gesture into
+        // the scale passed here; once it crosses ±10% we bump the persisted font
+        // size by one step and return 1.0f to reset the accumulator (Termux's
+        // canonical pattern). Below the threshold we pass it through unchanged.
+        override fun onScale(scale: Float): Float {
+            if (scale < 0.9f || scale > 1.1f) {
+                val step = if (scale < 1f) -1 else 1
+                val next = (terminalFontSize.value + step).coerceIn(MIN_FONT_SIZE, MAX_FONT_SIZE)
+                if (next != terminalFontSize.value) setTerminalFontSize(next)
+                return 1.0f
+            }
+            return scale
+        }
         override fun onSingleTapUp(e: MotionEvent?) {
             val view = viewRef?.get() ?: return
             // OSC 8: tap on a hyperlinked region launches the URL instead of the keyboard.
@@ -558,9 +584,10 @@ class TerminalViewModel @Inject constructor(
             // xterm CSI modifier: 1=none, 2=shift, 3=alt, 4=shift+alt, 5=ctrl,
             // 6=ctrl+shift, 7=ctrl+alt, 8=all. Used for "ESC [1;<m><final>".
             val mod = 1 + (if (shift) 1 else 0) + (if (alt) 2 else 0) + (if (ctrl) 4 else 0)
+            val appCursor = cursorKeysApplicationMode(session?.emulator)
             fun arrow(final: Char): ByteArray =
                 if (mod == 1) {
-                    if (isDecsetSet(session?.emulator, 1)) "\u001bO$final".toByteArray()
+                    if (cursorKeysApplicationMode(session?.emulator)) "\u001bO$final".toByteArray()
                     else "\u001b[$final".toByteArray()
                 } else {
                     "\u001b[1;$mod$final".toByteArray()
@@ -659,40 +686,12 @@ class TerminalViewModel @Inject constructor(
         session = null
     }
 
-    /**
-     * Compute cols/rows from view pixel dimensions + paint metrics and push
-     * directly to the session, bypassing TerminalView.updateSize() which depends
-     * on mRenderer being lazily initialized during the first draw. When the
-     * session is attached before first paint, updateSize() computes zero sizes,
-     * leaves the emulator at the initial 80x24 default, and TUI apps render
-     * into the wrong grid (visible symptom: btop draws in the top-left only,
-     * because the emulator is larger than the visible viewport).
-     */
-    fun forceUpdateSizeFromView(view: TerminalView, typeface: Typeface = Typeface.MONOSPACE) {
-        val sess = session ?: return
-        val w = view.width
-        val h = view.height
-        if (w <= 0 || h <= 0) {
-            Log.d(TAG, "forceUpdateSize: view not measured yet (${w}x${h})")
-            return
-        }
-        // Same typeface + raw pixel size as TerminalView.setTextSize(int) — which passes
-        // the int straight to Paint.setTextSize() without scaledDensity. Custom fonts
-        // (JetBrains Mono, Fira Code, etc.) have different cell metrics from monospace,
-        // so honor the view's actual typeface or TUI apps render in the wrong grid.
-        val paint = android.graphics.Paint().apply {
-            this.typeface = typeface
-            textSize = terminalFontSize.value.toFloat()
-            isAntiAlias = true
-        }
-        val charWidth = paint.measureText("M").coerceAtLeast(1f)
-        val fm = paint.fontMetrics
-        val lineHeight = (fm.descent - fm.ascent + fm.leading).coerceAtLeast(1f)
-        val cols = (w / charWidth).toInt().coerceAtLeast(20)
-        val rows = (h / lineHeight).toInt().coerceAtLeast(8)
-        Log.d(TAG, "forceUpdateSize: view=${w}x${h}px cell=${charWidth}x${lineHeight}px → ${cols}x${rows} chars")
-        sess.updateSize(cols, rows, charWidth.toInt(), lineHeight.toInt())
-    }
+    // forceUpdateSizeFromView was removed deliberately: every call site was
+    // replaced by view.updateSize() (whose row math subtracts
+    // mFontLineSpacingAndAscent). The two disagreed by ±1 row, causing a
+    // double-resize and cursor flicker on first paint and keyboard slides. Don't
+    // reintroduce a paint-metrics size computation here — see the comments at the
+    // TerminalView.updateSize() call sites in TerminalScreen.
 
     /**
      * Emit xterm focus-in/out (CSI I / CSI O) when the app gains/loses focus.
@@ -706,44 +705,35 @@ class TerminalViewModel @Inject constructor(
     fun sendFocusEvent(focused: Boolean) {
         val sess = session ?: return
         val emu = sess.emulator ?: return
-        if (!isDecsetSet(emu, 1004)) return
+        if (!emu.isFocusEventsEnabled) return
         val seq = if (focused) "\u001b[I".toByteArray() else "\u001b[O".toByteArray()
         sess.write(seq, 0, seq.size)
     }
 
-    /**
-     * Check if a DECSET mode is enabled in the emulator (e.g. 1 for DECCKM,
-     * 1004 for focus reporting). Uses reflection to access private fields
-     * and mapper methods in the Termux AAR.
-     */
-    private fun isDecsetSet(emu: TerminalEmulator?, bit: Int): Boolean {
-        if (emu == null) return false
-        return try {
-            val cls = TerminalEmulator::class.java
-            val mapper = cls.getDeclaredMethod("mapDecSetBitToInternalBit", Int::class.javaPrimitiveType)
-                .apply { isAccessible = true }
-            val internalBit = mapper.invoke(null, bit) as Int
-            val flagsField = cls.getDeclaredField("mCurrentDecSetFlags")
-                .apply { isAccessible = true }
-            val flags = flagsField.getInt(emu)
-            (flags and internalBit) != 0
-        } catch (_: Throwable) { false }
-    }
+    /** True when DECCKM (application cursor keys) is on, so arrows send SS3
+     *  (ESC O x) instead of CSI (ESC [ x). Public emulator accessor — no
+     *  reflection, so it keeps working under R8 in release (the private DECSET
+     *  field the old reflection read is not kept by proguard). */
+    private fun cursorKeysApplicationMode(emu: TerminalEmulator?): Boolean =
+        emu?.isCursorKeysApplicationMode == true
 
     fun sendExtraKey(key: String) {
         when (key) {
             "CTRL" -> { extraCtrl = !extraCtrl; return }
             "ALT"  -> { extraAlt = !extraAlt; return }
+            // Route through the same bracketed-paste-aware path as the long-press
+            // menu / middle-click, so the extra-keys row can paste too.
+            "PASTE" -> { sessionClient.onPasteTextFromClipboard(session); return }
         }
         val bytes = when (key) {
             "ESC"  -> byteArrayOf(27)
             "TAB"  -> byteArrayOf(9)
-            "UP"   -> if (isDecsetSet(session?.emulator, 1)) "\u001bOA".toByteArray() else "\u001b[A".toByteArray()
-            "DOWN" -> if (isDecsetSet(session?.emulator, 1)) "\u001bOB".toByteArray() else "\u001b[B".toByteArray()
-            "LEFT" -> if (isDecsetSet(session?.emulator, 1)) "\u001bOD".toByteArray() else "\u001b[D".toByteArray()
-            "RIGHT"-> if (isDecsetSet(session?.emulator, 1)) "\u001bOC".toByteArray() else "\u001b[C".toByteArray()
-            "HOME" -> if (isDecsetSet(session?.emulator, 1)) "\u001bOH".toByteArray() else "\u001b[H".toByteArray()
-            "END"  -> if (isDecsetSet(session?.emulator, 1)) "\u001bOF".toByteArray() else "\u001b[F".toByteArray()
+            "UP"   -> if (cursorKeysApplicationMode(session?.emulator)) "\u001bOA".toByteArray() else "\u001b[A".toByteArray()
+            "DOWN" -> if (cursorKeysApplicationMode(session?.emulator)) "\u001bOB".toByteArray() else "\u001b[B".toByteArray()
+            "LEFT" -> if (cursorKeysApplicationMode(session?.emulator)) "\u001bOD".toByteArray() else "\u001b[D".toByteArray()
+            "RIGHT"-> if (cursorKeysApplicationMode(session?.emulator)) "\u001bOC".toByteArray() else "\u001b[C".toByteArray()
+            "HOME" -> if (cursorKeysApplicationMode(session?.emulator)) "\u001bOH".toByteArray() else "\u001b[H".toByteArray()
+            "END"  -> if (cursorKeysApplicationMode(session?.emulator)) "\u001bOF".toByteArray() else "\u001b[F".toByteArray()
             "PGUP" -> "\u001b[5~".toByteArray()
             "PGDN" -> "\u001b[6~".toByteArray()
             "F1"   -> "\u001bOP".toByteArray()
@@ -780,5 +770,9 @@ class TerminalViewModel @Inject constructor(
 
     companion object {
         private const val TAG = "TerminalVM"
+        // Pinch-to-zoom font bounds (px). Matches the practical terminal range;
+        // keep in sync with the Quick Settings font slider.
+        private const val MIN_FONT_SIZE = 8
+        private const val MAX_FONT_SIZE = 48
     }
 }

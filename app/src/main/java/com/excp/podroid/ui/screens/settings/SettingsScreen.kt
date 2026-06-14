@@ -1,10 +1,14 @@
 package com.excp.podroid.ui.screens.settings
 
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts.RequestPermission
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -41,6 +45,7 @@ import androidx.compose.material3.windowsizeclass.WindowHeightSizeClass
 import androidx.compose.material3.windowsizeclass.WindowSizeClass
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -627,6 +632,7 @@ private fun DownloadsSharingRow(
 ) {
     val context = LocalContext.current
     val canManageAllFiles = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+    val writeStoragePermLauncher = rememberLauncherForActivityResult(RequestPermission()) { _ -> }
 
     @androidx.annotation.RequiresApi(Build.VERSION_CODES.R)
     fun openAllFilesAccessSettings() {
@@ -645,8 +651,16 @@ private fun DownloadsSharingRow(
                 checked = enabled && available,
                 onCheckedChange = { checked ->
                     onToggle(checked)
-                    if (checked && canManageAllFiles && !Environment.isExternalStorageManager()) {
-                        openAllFilesAccessSettings()
+                    if (checked) {
+                        if (canManageAllFiles && !Environment.isExternalStorageManager()) {
+                            openAllFilesAccessSettings()
+                        } else if (!canManageAllFiles &&
+                            ContextCompat.checkSelfPermission(
+                                context, android.Manifest.permission.WRITE_EXTERNAL_STORAGE
+                            ) != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            writeStoragePermLauncher.launch(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                        }
                     }
                 },
                 enabled = vmNotRunning && available,
@@ -855,6 +869,20 @@ private fun AdvancedTextSetting(
         if (localValue != value) localValue = value
     }
     var hadFocus by remember { mutableStateOf(false) }
+
+    // Commit a pending edit on dispose: persistence only happens on focus loss,
+    // but pressing system back while the field is still focused disposes the
+    // composable without a focus-change event, silently dropping the edit.
+    // rememberUpdatedState so onDispose sees the latest buffered/upstream values.
+    val currentUpstream by rememberUpdatedState(value)
+    val currentOnValueChange by rememberUpdatedState(onValueChange)
+    DisposableEffect(Unit) {
+        onDispose {
+            if (hadFocus && localState.value != currentUpstream) {
+                currentOnValueChange(localState.value)
+            }
+        }
+    }
 
     Column(modifier = Modifier.fillMaxWidth()) {
         OutlinedTextField(

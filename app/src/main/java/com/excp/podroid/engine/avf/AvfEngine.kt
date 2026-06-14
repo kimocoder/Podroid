@@ -31,10 +31,13 @@ import com.excp.podroid.util.LogProxy
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -51,7 +54,7 @@ import javax.inject.Singleton
 @Singleton
 class AvfEngine @Inject constructor(
     @ApplicationContext private val context: Context,
-    @Suppress("UnusedPrivateMember") private val settingsRepository: SettingsRepository,
+    private val settingsRepository: SettingsRepository,
 ) : VmEngine {
 
     companion object {
@@ -60,15 +63,23 @@ class AvfEngine @Inject constructor(
         // "podroid-avf-smoke" — a different name — so there is no config
         // conflict between the two paths.
         private const val VM_NAME = "podroid"
-        // Mirrors QemuEngine's 60s boot-timeout fallback so a guest that never
-        // emits "Ready!" (a console quirk, a lost marker, no onStopped/onDied)
-        // doesn't strand the engine in Starting forever — EngineHolder.trySwap
-        // waits on a terminal state, so a stuck Starting blocks backend switch.
-        private const val BOOT_TIMEOUT_MS = 60_000L
+        // Safety net for a guest that never emits "Ready!" (a console quirk, a
+        // lost marker, no onStopped/onDied) so it doesn't strand the engine in
+        // Starting forever — EngineHolder.trySwap waits on a terminal state, so
+        // a stuck Starting blocks backend switch. Sized to match QemuEngine's
+        // BOOT_READY_SAFETY_MS: a first boot does dropbear host-key generation
+        // (~56s worst case) which AVF performs too. A premature forced-Running
+        // is worse on AVF than QEMU — the console.log privacy gate (onVmBytes)
+        // closes on leaving Starting, so the tail of a genuinely slow boot
+        // (including a late panic) would be lost.
+        private const val BOOT_TIMEOUT_MS = 120_000L
         // Upper bound on the best-effort guest flush before stop. Bounded so a
         // hung guest can never block the stop path; the caller proceeds to kill
         // the VM if no SYNCED ack arrives.
         private const val SYNC_TIMEOUT_MS = 8_000L
+        // VirtualMachineCallback.STOP_REASON_REBOOT — a guest-requested reboot,
+        // which during early boot is the MATCH_HOST topology crash (issue #29).
+        private const val STOP_REASON_REBOOT = 5
     }
 
     private val _state = MutableStateFlow<VmState>(VmState.Idle)
@@ -120,6 +131,12 @@ class AvfEngine @Inject constructor(
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // Serializes the check-and-claim in start(). Two near-simultaneous
+    // ACTION_STARTs can both pass PodroidService's main-thread alreadyActive
+    // check before either coroutine flips _state to Starting; without this lock
+    // both would run launchAttempt against the same VM_NAME (mirrors
+    // QemuEngine.startMutex).
+    private val startMutex = Mutex()
     // @Volatile: written on the start()/cleanup() thread, read from stop() and
     // addPortForward() on other threads. Every other shared lifecycle field here
     // (control, stopRequested, vmGeneration) is already @Volatile for the same
@@ -169,6 +186,19 @@ class AvfEngine @Inject constructor(
     @Volatile private var lastSentRows = -1
     @Volatile private var lastSentCols = -1
 
+    // Adaptive multi-vCPU fallback (issue #29). The launch args are remembered so
+    // an early-boot reset can re-launch with fewer cores WITHOUT going through a
+    // terminal state (which would tear the foreground service down). attemptedCpus
+    // is the effective count the current boot was started with, read by the
+    // onStopped funnel to decide the next rung. See AvfCpuPolicy.
+    @Volatile private var lastConfig: VmConfig? = null
+    private val lastPortForwards = mutableListOf<com.excp.podroid.data.repository.PortForwardRule>()
+    @Volatile private var attemptedCpus = 1
+    // True when buildConfig chose the explicit-cpuCount topology (Android 16+
+    // raw AIDL, the #29 fix proper) — launchAttempt must then arm the createVm
+    // hook; the cmdline carries no nr_cpus on that path.
+    @Volatile private var useExplicitCpuCount = false
+
     /** Backend-specific diagnostics for the export log (observational only). */
     @Volatile private var lastLifecycleEvent: String = "(no lifecycle callback yet)"
     @Volatile private var launchConfigSummary: String = "(VM not started this session)"
@@ -177,7 +207,14 @@ class AvfEngine @Inject constructor(
     val terminalSockPath: String get() = "${context.filesDir.absolutePath}/avf-terminal.sock"
     val ctrlSockPath: String get() = "${context.filesDir.absolutePath}/avf-ctrl.sock"
 
-    private val detector = BootStageDetector(_bootStage, _state) {
+    // Per-run detector (re-created each launchAttempt, not reset-and-reused).
+    // A fresh instance means a prior run's still-draining ConsoleFanout pump
+    // feeds the OLD detector (already ready=true, ignored) instead of flipping
+    // the NEW boot to Running on a late "Ready!" — the one state-transition
+    // path the generation token didn't otherwise cover.
+    @Volatile private var detector = newDetector()
+
+    private fun newDetector() = BootStageDetector(_bootStage, _state) {
         // Detector already flipped _state to Running; stamp the uptime origin.
         _runningSinceMs = System.currentTimeMillis()
         Log.i(TAG, "boot Ready! detected — bridge connects via ConsoleFanout")
@@ -218,12 +255,46 @@ class AvfEngine @Inject constructor(
         control = ctl
         ctl.open()
         scope.launch {
-            for (rule in initialRules) addPortForward(rule)
+            // addPortForward now rethrows on failure (for EngineHolder's retry).
+            // Guard each replay so one failing rule doesn't abort the rest;
+            // EngineHolder's diff still retries genuinely-failed DataStore rules.
+            for (rule in initialRules) {
+                try {
+                    addPortForward(rule)
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (e: Throwable) {
+                    Log.w(TAG, "initial forward replay failed for $rule (continuing)", e)
+                }
+            }
         }
     }
 
     override suspend fun start(portForwards: List<PortForwardRule>, config: VmConfig) {
-        if (_state.value is VmState.Running || _state.value is VmState.Starting) return
+        startMutex.withLock {
+            if (_state.value is VmState.Running || _state.value is VmState.Starting) return
+            // Remember the launch args so the adaptive multi-vCPU fallback (issue
+            // #29) can re-launch with fewer cores after an early-boot reset WITHOUT
+            // routing through a terminal state (Error/Stopped tears the foreground
+            // service down — see PodroidService.observeStateForShutdown). Claim
+            // Starting under the lock so a re-entrant start() is rejected.
+            lastConfig = config
+            synchronized(lastPortForwards) { lastPortForwards.clear(); lastPortForwards.addAll(portForwards) }
+            _state.value = VmState.Starting
+        }
+        launchAttempt(portForwards, config, bootMsg = "Initializing AVF...")
+    }
+
+    /**
+     * One VM boot attempt. Split out of start() so the adaptive vCPU fallback
+     * (relaunchWithFewerCpus) can re-enter it after an early-boot reset while the
+     * state stays Starting. Assumes _state is already Starting.
+     */
+    private suspend fun launchAttempt(
+        portForwards: List<PortForwardRule>,
+        config: VmConfig,
+        bootMsg: String,
+    ) {
         // New VM lifetime: bump the generation so any in-flight callback from a
         // prior VM is ignored, clear the user-stop flag, and arm cleanup() to run
         // once on this run's first terminal transition.
@@ -237,12 +308,11 @@ class AvfEngine @Inject constructor(
         _consoleText.value = ""
         initialRules.clear()
         initialRules.addAll(portForwards)
-        _state.value = VmState.Starting
-        _bootStage.value = "Initializing AVF..."
-        // Re-arm the one-shot detector so a Stop → Start cycle's second boot
-        // can fire onReady again. Without this the new boot's "Ready!" marker
-        // is silently ignored and state stays Starting forever.
-        detector.reset()
+        _bootStage.value = bootMsg
+        // Fresh detector per run so a Stop → Start cycle's second boot can fire
+        // onReady again AND a prior run's late console bytes can't drive this
+        // boot's state (see the field comment).
+        detector = newDetector()
 
         try {
             val mgr = AvfReflect.manager(context)
@@ -265,6 +335,18 @@ class AvfEngine @Inject constructor(
             }
             vmHandle = vm
 
+            // Explicit-cpuCount topology (issue #29): arm the createVm rewrite
+            // before run(). A failed install poisons the hook process-wide, so
+            // the immediate relaunch rebuilds the cmdline on the nr_cpus
+            // fallback path — this cannot recurse a second time.
+            if (useExplicitCpuCount && !AvfReflect.installExplicitCpuCount(vm, attemptedCpus)) {
+                Log.w(TAG, "explicit vCPU hook unavailable at install time; " +
+                    "relaunching on the nr_cpus fallback path")
+                cleanup()
+                launchAttempt(portForwards, config, bootMsg)
+                return
+            }
+
             val cb = AvfReflect.newVmCallback(
                 onError = { code, msg ->
                     Log.e(TAG, "VM onError ${AvfReasonCodes.errorCode(code)} msg=$msg")
@@ -278,15 +360,23 @@ class AvfEngine @Inject constructor(
                 onStopped = { reason ->
                     Log.i(TAG, "VM onStopped ${AvfReasonCodes.stopReason(reason)}")
                     lastLifecycleEvent = "onStopped(${AvfReasonCodes.stopReason(reason)})"
-                    // A stop while still Starting means the VM exited during boot;
-                    // otherwise it's a clean stop. The funnel maps a user-stop to
-                    // Stopped regardless and ignores stale/terminal transitions.
-                    val target = if (_state.value is VmState.Starting && !stopRequested) {
-                        VmState.Error("VM exited during boot (${AvfReasonCodes.stopReason(reason)})")
-                    } else {
-                        VmState.Stopped
+                    // Adaptive multi-vCPU fallback (issue #29): an early-boot reset
+                    // (STOP_REASON_REBOOT while still Starting) with more than one
+                    // core attempted is the MATCH_HOST heterogeneous-topology crash
+                    // on Tensor G3/G4. Step the core count down and relaunch rather
+                    // than surfacing an error; only a reset at 1 core (or a clean
+                    // stop) falls through to the normal terminal handling.
+                    if (!maybeRelaunchWithFewerCpus(generation, reason)) {
+                        // A stop while still Starting means the VM exited during boot;
+                        // otherwise it's a clean stop. The funnel maps a user-stop to
+                        // Stopped regardless and ignores stale/terminal transitions.
+                        val target = if (_state.value is VmState.Starting && !stopRequested) {
+                            VmState.Error("VM exited during boot (${AvfReasonCodes.stopReason(reason)})")
+                        } else {
+                            VmState.Stopped
+                        }
+                        onVmTerminal(generation, target)
                     }
-                    onVmTerminal(generation, target)
                 },
                 onDied = { reason ->
                     // onDied fires on backend-level death (virtmgr/crosvm), often
@@ -366,6 +456,16 @@ class AvfEngine @Inject constructor(
             fanout = fo
             fo.start()
 
+            // Final stop-vs-start interleave guard: a user Stop landing during
+            // config build / VM create set stopRequested (and took the
+            // null-handle terminal path). Don't run() a VM the user already
+            // asked to stop — clean up and bail before it boots headless.
+            if (stopRequested || cleanedUp.get()) {
+                Log.i(TAG, "AVF launch aborted before run() — stop requested mid-start")
+                cleanup()
+                return
+            }
+
             AvfReflect.run(vm)
             val status = runCatching { AvfReflect.getStatus(vm) }.getOrDefault(-1)
             Log.i(TAG, "vm.run() returned — VM booting (status=$status)")
@@ -389,12 +489,63 @@ class AvfEngine @Inject constructor(
                     bringUpControlChannel()
                 }
             }
+        } catch (e: CancellationException) {
+            // The start coroutine runs in PodroidService.serviceScope, cancelled
+            // on every stop/teardown; buildConfig has real suspension points (the
+            // DataStore cpu-cap read). A cancel landing mid-start is NOT an engine
+            // error — letting it fall into the generic catch below would set a
+            // sticky Error that poisons the next start (QemuEngine guards the same
+            // way). Clean up and let the cancellation propagate.
+            Log.i(TAG, "AVF start cancelled (teardown) — not an error")
+            cleanup()
+            throw e
         } catch (e: Throwable) {
             val cause = e.cause ?: e
             Log.e(TAG, "AVF start failed", cause)
             _state.value = VmState.Error("AVF rejected: ${cause.javaClass.simpleName}: ${cause.message}")
             cleanup()
         }
+    }
+
+    /**
+     * Adaptive multi-vCPU fallback for the Tensor G3/G4 MATCH_HOST early-boot
+     * reset (issue #29). Returns true if it consumed the stop event by scheduling
+     * a relaunch with fewer cores; false to let normal terminal handling proceed.
+     *
+     * Fires only on a STOP_REASON_REBOOT for the live generation, while still
+     * Starting, not user-initiated, with more than one core attempted. The next
+     * lower count (AvfCpuPolicy.nextRungDown) is persisted so later launches skip
+     * straight to a value that boots; the relaunch keeps _state in Starting so the
+     * foreground service stays up (a terminal state would tear it down). The
+     * ladder is finite and monotonic (e.g. 8 -> 2 -> 1), so this can't loop.
+     */
+    private fun maybeRelaunchWithFewerCpus(generation: Long, reason: Int): Boolean {
+        if (reason != STOP_REASON_REBOOT) return false
+        if (generation != vmGeneration) return false
+        if (stopRequested || _state.value !is VmState.Starting) return false
+        val next = AvfCpuPolicy.nextRungDown(attemptedCpus) ?: return false
+        val config = lastConfig ?: return false
+        val forwards = synchronized(lastPortForwards) { lastPortForwards.toList() }
+        val mode = if (useExplicitCpuCount) "explicit-count" else "MATCH_HOST+nr_cpus"
+        Log.w(TAG, "AVF early-boot reset at $attemptedCpus vCPU(s) ($mode topology, #29); " +
+            "capping to $next and relaunching")
+        scope.launch {
+            runCatching { settingsRepository.setAvfCpuCap(next) }
+                .onFailure { Log.w(TAG, "persisting AVF cpu cap failed (continuing)", it) }
+            // Free the dead VM's resources without a terminal transition: cleanup()
+            // never touches _state, and launchAttempt re-arms cleanedUp.
+            cleanup()
+            // A user Stop landing between the callback-thread check above and here
+            // must win: cleanup() ran, so honour the stop instead of relaunching.
+            if (stopRequested) {
+                Log.i(TAG, "AVF relaunch aborted — stop requested during cleanup")
+                onVmTerminal(vmGeneration, VmState.Stopped)
+                return@launch
+            }
+            val plural = if (next == 1) "" else "s"
+            launchAttempt(forwards, config, bootMsg = "Retrying with $next core$plural...")
+        }
+        return true
     }
 
     /**
@@ -428,16 +579,21 @@ class AvfEngine @Inject constructor(
     }
 
     override fun stop() {
+        // Mark the stop as user-initiated FIRST so any in-flight launchAttempt
+        // (which checks stopRequested before AvfReflect.run) and any resulting
+        // onStopped/onDied/onError is mapped to Stopped, never downgraded to
+        // Error. Set on the null-handle path too: a stop landing in the window
+        // between _state=Starting and vmHandle=vm must not let launchAttempt
+        // proceed to run() a VM the user already asked to stop.
+        stopRequested = true
         val vm = vmHandle
         if (vm == null) {
-            // Nothing running (or already torn down). Make sure state is terminal
-            // so EngineHolder.trySwap can release, then run the idempotent cleanup.
+            // Nothing running (or already torn down, or start hasn't reached
+            // vmHandle assignment). Make sure state is terminal so
+            // EngineHolder.trySwap can release, then run the idempotent cleanup.
             onVmTerminal(vmGeneration, VmState.Stopped)
             return
         }
-        // Mark the stop as user-initiated so a resulting onStopped/onDied/onError
-        // is mapped to Stopped (never downgraded to Error) by the funnel.
-        stopRequested = true
         val generation = vmGeneration
         scope.launch {
             // Best-effort guest flush so unwritten ext4 data hits storage before
@@ -449,10 +605,21 @@ class AvfEngine @Inject constructor(
             val requested = runCatching { AvfReflect.stop(vm) }
                 .onFailure { Log.w(TAG, "AVF stop() request failed; VM may still be running", it) }
                 .isSuccess
+            if (!requested) {
+                // The framework rejected stop(): the VM is still live. Forcing
+                // Stopped + cleanup() here would null vmHandle, stranding an
+                // unkillable crosvm (see AvfReflect.stop contract). Surface an
+                // error and KEEP the handle so a later real callback, or a retry,
+                // can still reach the VM. Don't run the watchdog on this path.
+                if (generation == vmGeneration && !cleanedUp.get()) {
+                    _state.value = VmState.Error("AVF stop request rejected; VM may still be running")
+                }
+                return@launch
+            }
             // Drive the final Stopped + cleanup from onStopped/onDied. If no
-            // terminal callback arrives (or stop() was rejected), a bounded
-            // watchdog forces the transition so we never strand in Running.
-            kotlinx.coroutines.delay(if (requested) 5_000L else 1_000L)
+            // terminal callback arrives, a bounded watchdog forces the transition
+            // so we never strand in Running.
+            kotlinx.coroutines.delay(5_000L)
             if (generation == vmGeneration && !cleanedUp.get()) {
                 Log.w(TAG, "AVF stop: no terminal callback within timeout — forcing Stopped")
                 onVmTerminal(generation, VmState.Stopped)
@@ -471,11 +638,14 @@ class AvfEngine @Inject constructor(
         // TCP keeps vport == hostPort (unchanged); UDP is offset so a TCP and a
         // UDP rule on the same host port don't collide on the vsock port space.
         val vport = AvfVport.forRule(rule)
+        // Implicit VNC/audio forwards bind loopback so an authless X session +
+        // raw PCM aren't exposed to the LAN; user rules stay 0.0.0.0.
+        val bindAddr = if (rule.loopbackOnly) "127.0.0.1" else "0.0.0.0"
         try {
             val fw: Forwarder = if (rule.protocol == "udp") {
-                VsockUdpForwarder(hostPort = rule.hostPort, guestVsockPort = vport, vm = vm, scope = scope)
+                VsockUdpForwarder(hostPort = rule.hostPort, guestVsockPort = vport, vm = vm, scope = scope, bindAddress = bindAddr)
             } else {
-                VsockPortForwarder(hostPort = rule.hostPort, guestVsockPort = vport, vm = vm, scope = scope)
+                VsockPortForwarder(hostPort = rule.hostPort, guestVsockPort = vport, vm = vm, scope = scope, bindAddress = bindAddr)
             }
             // putIfAbsent races safely with a concurrent addPortForward for the
             // same vport — only one forwarder wins; the loser is closed here. fw
@@ -501,10 +671,18 @@ class AvfEngine @Inject constructor(
                 Log.w(TAG, "addPortForward(${rule.hostPort}/${rule.protocol}): control channel not up yet; " +
                     "guest ADD skipped (host listener is bound)")
             }
-            Log.i(TAG, "live forward up: 0.0.0.0:${rule.hostPort}/${rule.protocol} → vsock:$vport → 127.0.0.1:${rule.guestPort}")
+            Log.i(TAG, "live forward up: ${rule.hostPort}/${rule.protocol} → vsock:$vport → 127.0.0.1:${rule.guestPort}")
+        } catch (c: CancellationException) {
+            forwarders.remove(vport)
+            throw c
         } catch (e: Throwable) {
             forwarders.remove(vport)
             Log.w(TAG, "addPortForward($rule) failed", e)
+            // Rethrow so EngineHolder's diff records this rule as not-applied and
+            // retries on the next diff, instead of permanently treating a
+            // transient failure as live. The initialRules replay loop guards each
+            // call so one failure there doesn't abort the rest.
+            throw e
         }
     }
 
@@ -644,10 +822,27 @@ class AvfEngine @Inject constructor(
     private fun ensureStorageImage(storageSizeGb: Int): File {
         val storageFile = File(context.filesDir, "storage.img")
         val desiredBytes = storageSizeGb.toLong() * 1024L * 1024L * 1024L
-        if (storageFile.exists() && storageFile.length() == desiredBytes) return storageFile
         if (storageFile.exists()) {
-            Log.d(TAG, "storage.img size mismatch — recreating")
-            storageFile.delete()
+            val current = storageFile.length()
+            when {
+                current == desiredBytes -> return storageFile
+                // NEVER delete: storage.img is the persistent ext4 overlay. Grow
+                // in place when larger (guest resize2fs claims it on next boot);
+                // keep as-is if smaller (shrinking would corrupt the filesystem).
+                // Deleting on mismatch could wipe all guest data. See QemuEngine.
+                desiredBytes > current -> {
+                    runCatching {
+                        java.io.RandomAccessFile(storageFile, "rw").use { it.setLength(desiredBytes) }
+                    }.onSuccess {
+                        Log.i(TAG, "storage.img grown ${current / (1024 * 1024)}MB → ${storageSizeGb}GB (guest resize2fs on next boot)")
+                    }.onFailure { Log.e(TAG, "Failed to grow storage.img", it) }
+                    return storageFile
+                }
+                else -> {
+                    Log.w(TAG, "storage.img (${current / (1024 * 1024)}MB) larger than requested ${storageSizeGb}GB; keeping existing image (shrink would corrupt the filesystem)")
+                    return storageFile
+                }
+            }
         }
         try {
             java.io.RandomAccessFile(storageFile, "rw").use { it.setLength(desiredBytes) }
@@ -688,7 +883,28 @@ class AvfEngine @Inject constructor(
         appendLine("last VM lifecycle callback: $lastLifecycleEvent")
     }
 
-    private fun buildConfig(mgr: Any, config: VmConfig): Any {
+    private suspend fun buildConfig(mgr: Any, config: VmConfig): Any {
+        // Resolve the effective vCPU count: the user's request, clamped by any
+        // per-device cap discovered by a prior early-boot reset (issue #29).
+        // attemptedCpus feeds the onStopped fallback ladder.
+        val cpuCap = runCatching { settingsRepository.getAvfCpuCapSnapshot() }
+            .getOrDefault(AvfCpuPolicy.NO_CAP)
+        val effectiveCpus = AvfCpuPolicy.effectiveCpus(config.cpus, cpuCap)
+        attemptedCpus = effectiveCpus
+        // Multi-core topology mode (issue #29). Preferred: an exact homogeneous
+        // vCPU count via the Android 16+ raw AIDL (no heterogeneous host
+        // topology cloned into the guest — the confirmed reset trigger on
+        // Tensor G3/G4). Fallback: MATCH_HOST bounded by nr_cpus on the kernel
+        // cmdline. At 1 core the builder's ONE_CPU already means a clean
+        // single-vCPU topology, so neither mechanism is needed.
+        useExplicitCpuCount = effectiveCpus > 1 && AvfReflect.supportsExplicitCpuCount()
+        // Clear any explicit-count arming left on the process-shared binder proxy
+        // from a prior launch. launchAttempt re-arms via installExplicitCpuCount
+        // when useExplicitCpuCount is true; on every other path (ONE_CPU, the
+        // nr_cpus fallback tier, the ladder's 1-core rescue) a stale count must
+        // NOT rewrite this launch's topology back up (issue #29).
+        if (!useExplicitCpuCount) AvfReflect.disarmExplicitCpuCount()
+
         val kernelSrc = File(context.filesDir, "vmlinuz-virt").also {
             require(it.exists()) { "kernel missing at ${it.absolutePath}" }
         }
@@ -729,15 +945,28 @@ class AvfEngine @Inject constructor(
         // finally leaves a panic instead of an empty console.log. keep_bootcon
         // keeps it printing after the real console registers.
         val earlycon = "earlycon keep_bootcon"
+        // ignore_loglevel makes earlycon print the full early boot (incl. an
+        // early-boot panic like the #29 MATCH_HOST reset) into console.log. The
+        // default extra cmdline is `loglevel=1 quiet`, which suppresses it, so
+        // gate this behind the verbose-logging toggle — on for reporters who need
+        // a capture, off for everyone else.
         val verboseFlags = if (config.verboseLogging) " ignore_loglevel" else ""
+        // Fallback tier only (devices without the explicit-count AIDL): bound
+        // the cores the GUEST KERNEL brings up under MATCH_HOST. The full
+        // heterogeneous topology is still emitted; nr_cpus just limits how many
+        // vCPUs the kernel onlines (#29). On the explicit-count path the guest
+        // gets a clean N-vCPU topology and must online all of them. See
+        // AvfCpuPolicy.
+        val nrCpusFlag =
+            if (effectiveCpus > 1 && !useExplicitCpuCount) " nr_cpus=$effectiveCpus" else ""
         val resolvedCmdline = ("console=hvc0 $earlycon root=/dev/ram0 mitigations=off " +
             "elevator=mq-deadline podroid.tty=hvc0 podroid.backend=avf podroid.epoch=$epoch " +
-            "podroid.x11.dpi=${config.x11Dpi}$verboseFlags " +
+            "podroid.x11.dpi=${config.x11Dpi}$verboseFlags$nrCpusFlag " +
             config.kernelExtraCmdline).trim()
         AvfReflect.addParams(cb, resolvedCmdline)
         if (config.verboseLogging) {
             Log.i(TAG, "verbose: resolved cmdline = $resolvedCmdline")
-            Log.i(TAG, "verbose: ramMb=${config.ramMb} cpus=${config.cpus} " +
+            Log.i(TAG, "verbose: ramMb=${config.ramMb} cpus=$effectiveCpus (requested ${config.cpus}) " +
                 "storageAccess=${config.storageAccessEnabled}")
         }
         AvfReflect.addDisk(cb, storage.absolutePath, writable = true)
@@ -800,14 +1029,21 @@ class AvfEngine @Inject constructor(
             }
         }
         AvfReflect.setMemoryBytes(vb, config.ramMb.toLong() * 1024 * 1024)
-        AvfReflect.setNumCpus(vb, config.cpus)
+        AvfReflect.setNumCpus(vb, effectiveCpus)
         AvfReflect.setDebugLevel(vb, AvfReflect.DEBUG_LEVEL_FULL)
         AvfReflect.setConsoleInputDevice(vb, "hvc0")         // virtio-console (line-rate), NOT PL011
         AvfReflect.setConnectVmConsole(vb, false)            // false: avoid inheriting Activity FDs (SurfaceFlinger sync fences → SELinux denial)
         AvfReflect.setVmOutputCaptured(vb, true)
         AvfReflect.setVmConsoleInputSupported(vb, true)
         AvfReflect.setCustomImageConfig(vb, customCfg)
-        launchConfigSummary = "vCPUs=${config.cpus}, memory=${config.ramMb}MB, console=hvc0, " +
+        val capStr = if (cpuCap > AvfCpuPolicy.NO_CAP) ", cpuCap=$cpuCap" else ""
+        val cpuMode = when {
+            effectiveCpus <= 1 -> "one-cpu"
+            useExplicitCpuCount -> "explicit-count"
+            else -> "match-host+nr_cpus"
+        }
+        launchConfigSummary = "vCPUs=$effectiveCpus ($cpuMode, requested ${config.cpus}$capStr), " +
+            "memory=${config.ramMb}MB, console=hvc0, " +
             "protectedVm=$protectedStr, downloadsShare=$shareSummary, verboseLogging=${config.verboseLogging}"
         return AvfReflect.build(vb)
     }

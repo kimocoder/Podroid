@@ -210,10 +210,19 @@ class QemuEngine @Inject constructor(
     override fun createTerminalSession(client: TerminalSessionClient): TerminalSession {
         sessionClientDelegate = client
 
-        // Session already auto-started during boot — just return it
-        if (_terminalSession != null) {
+        // Reuse the boot-time session ONLY if it's still alive. A finished
+        // session (bridge died while the VM kept running) must not be handed
+        // back — re-entering the terminal screen would otherwise show the dead
+        // "[Process completed]" buffer forever. Drop it and fall through to
+        // spawn a fresh bridge against the still-running VM.
+        val cached = _terminalSession
+        if (cached != null && cached.isRunning) {
             Log.d(TAG, "Returning pre-started terminal session")
-            return _terminalSession!!
+            return cached
+        }
+        if (cached != null) {
+            Log.d(TAG, "Cached terminal session is dead — recreating against the running VM")
+            _terminalSession = null
         }
 
         // Fallback: create session now
@@ -446,15 +455,22 @@ class QemuEngine @Inject constructor(
     override suspend fun addPortForward(rule: PortForwardRule) {
         if (_state.value !is VmState.Running) return
         val qmp = qmpClient ?: return
-        runCatching { qmp.addPortForward(rule.hostPort, rule.guestPort, rule.protocol) }
+        // QmpClient returns Result and never throws, so the failure lives INSIDE
+        // the returned Result — unwrap it. getOrThrow rethrows so EngineHolder
+        // records this rule as not-applied and retries on the next diff (a
+        // host-port-already-bound failure would otherwise be permanently dropped
+        // and silently recorded as live).
+        qmp.addPortForward(rule.hostPort, rule.guestPort, rule.protocol, rule.loopbackOnly)
             .onFailure { Log.w(TAG, "QMP addPortForward failed for $rule", it) }
+            .getOrThrow()
     }
 
     override suspend fun removePortForward(rule: PortForwardRule) {
         if (_state.value !is VmState.Running) return
         val qmp = qmpClient ?: return
-        runCatching { qmp.removePortForward(rule.hostPort, rule.protocol) }
+        qmp.removePortForward(rule.hostPort, rule.protocol, rule.loopbackOnly)
             .onFailure { Log.w(TAG, "QMP removePortForward failed for $rule", it) }
+            .getOrThrow()
     }
 
     @Synchronized
@@ -552,9 +568,14 @@ class QemuEngine @Inject constructor(
         val downloadsDir = android.os.Environment.getExternalStoragePublicDirectory(
             android.os.Environment.DIRECTORY_DOWNLOADS
         )
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R &&
-            config.storageAccessEnabled &&
-            android.os.Environment.isExternalStorageManager() &&
+        val hasStorageAccess = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R)
+            android.os.Environment.isExternalStorageManager()
+        else
+            androidx.core.content.ContextCompat.checkSelfPermission(
+                context, android.Manifest.permission.WRITE_EXTERNAL_STORAGE
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (config.storageAccessEnabled &&
+            hasStorageAccess &&
             downloadsDir.exists()) {
             // security_model=mapped-xattr keeps QEMU's 9p worker out of the
             // chmod/chown syscall path that has triggered SIGILL on Tensor /
@@ -570,7 +591,11 @@ class QemuEngine @Inject constructor(
         val netdevArg = buildString {
             append("user,id=net0,ipv6=off")
             for (rule in portForwards) {
-                append(",hostfwd=${rule.protocol}::${rule.hostPort}-:${rule.guestPort}")
+                // hostfwd hostaddr: empty = 0.0.0.0 (LAN-reachable, user rules);
+                // 127.0.0.1 for loopbackOnly rules (implicit VNC/audio) so they
+                // aren't exposed to the network.
+                val hostAddr = if (rule.loopbackOnly) "127.0.0.1" else ""
+                append(",hostfwd=${rule.protocol}:$hostAddr:${rule.hostPort}-:${rule.guestPort}")
             }
         }
         args += "-netdev"; args += netdevArg
@@ -626,9 +651,28 @@ class QemuEngine @Inject constructor(
         val desiredBytes = storageSizeGb.toLong() * 1024L * 1024L * 1024L
 
         if (storageFile.exists()) {
-            if (storageFile.length() == desiredBytes) return
-            Log.d(TAG, "storage.img size mismatch — recreating")
-            storageFile.delete()
+            val current = storageFile.length()
+            when {
+                current == desiredBytes -> return
+                // NEVER delete: storage.img is the persistent ext4 overlay (every
+                // apk add, container, user file). Deleting on mismatch could wipe
+                // all guest data if the size ever changes (a corrupted DataStore
+                // falling back to the 2GB default, or a future resize UI). Grow in
+                // place when larger — the guest's first-boot resize2fs claims the
+                // new space; truncating to shrink would corrupt the filesystem.
+                desiredBytes > current -> {
+                    runCatching {
+                        java.io.RandomAccessFile(storageFile, "rw").use { it.setLength(desiredBytes) }
+                    }.onSuccess {
+                        Log.i(TAG, "storage.img grown ${current / (1024 * 1024)}MB → ${storageSizeGb}GB (guest resize2fs on next boot)")
+                    }.onFailure { Log.e(TAG, "Failed to grow storage.img", it) }
+                    return
+                }
+                else -> {
+                    Log.w(TAG, "storage.img (${current / (1024 * 1024)}MB) larger than requested ${storageSizeGb}GB; keeping existing image (shrink would corrupt the filesystem)")
+                    return
+                }
+            }
         }
 
         try {

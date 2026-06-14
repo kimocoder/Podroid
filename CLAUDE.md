@@ -4,7 +4,7 @@ Guidance for Claude Code (and any AI assistant or new contributor) working in th
 
 ## What Is This
 
-Podroid is an Android app that runs a real **Alpine 3.23** Linux VM on stock Android 9+ (arm64) to provide rootless **Podman / Docker / LXC** containers and an in-app **X11 desktop** - no root, no custom recovery.
+Podroid is an Android app that runs a real **Alpine 3.23** Linux VM on stock Android 8+ (arm64) to provide rootless **Podman / Docker / LXC** containers and an in-app **X11 desktop** - no root, no custom recovery.
 
 - **Two interchangeable VM backends** behind one interface (`VmEngine`):
   - **QEMU (TCG)** - software emulation, the default, needs no special permission.
@@ -18,7 +18,7 @@ Podroid is an Android app that runs a real **Alpine 3.23** Linux VM on stock And
 |---|---|
 | Package | `com.excp.podroid` (debug: `com.excp.podroid.debug`) |
 | Version | `versionName` / `versionCode` in `app/build.gradle.kts` |
-| Min / target SDK | 28 (Android 9) / 36 |
+| Min / target SDK | 26 (Android 8) / 36 |
 | Architecture | arm64 (`aarch64`) only |
 | Guest | Alpine 3.23 squashfs + persistent ext4 overlay, OpenRC PID 1 |
 | Kernel | custom Linux, version pinned by `podroidKernelVersion` in `gradle.properties` |
@@ -166,6 +166,8 @@ Single-activity Compose app: `ui/navigation/NavGraph.kt` routes `setup → home 
 ├── podroid-bridge.c                     # PTY <-> virtio-console relay -> libpodroid-bridge.so
 ├── podroid-launcher.c                   # exec wrapper that ties QEMU's lifetime to the app -> libpodroid-launcher.so
 ├── Dockerfile                           # kernel + initramfs + QEMU build
+├── build-tools/                         # static assets used during Docker builds
+│   └── cross-android-aarch64.ini        # Meson cross-compilation config for aarch64-android26
 ├── build-rootfs/
 │   ├── Dockerfile.rootfs, build-rootfs.sh
 │   ├── vsock-agent/                     # podroid-vsock-agent.c (AVF control/forward agent)
@@ -207,6 +209,9 @@ In `QemuEngine.buildCommand()`: `tcg,thread=multi`, larger `tb-size` for ≥2GB 
 
 ## Quirks & gotchas
 
+- **`CONFIG_DEVTMPFS_MOUNT=y` pre-mounts `/dev` before `/init` runs.** `init-podroid` must use `mount ... || true` for the devtmpfs line — the kernel's pre-populated `/dev` is sufficient and a second `mount(2)` returns EBUSY. Also: `size=` is not valid for devtmpfs in kernels where it is ramfs-backed (causes EINVAL). Either failure exits util-linux with `MNT_EX_FAIL=32`; `set -e` propagates `exit(32)`, encoded as `exitcode=0x00002000` ("Attempted to kill init!"). Always keep the `|| true`.
+- **util-linux `mount` stops option parsing at the first non-option argument** when `POSIXLY_CORRECT` is set. Put `-o` flags *before* device and mountpoint (`mount -t proc -o noexec,nosuid,nodev proc /proc`), not after. Options placed after the mountpoint are silently dropped, causing `mount(2)` to be called with `flags=0` and returning EPERM — which util-linux prints as "must be superuser to use mount" even for root.
+- **`Dockerfile` heredoc gotcha.** Docker BuildKit's parser treats `[section]` lines inside `RUN ... << 'EOF'` heredocs as unknown Dockerfile instructions and aborts the parse. Instead of using shell heredocs in `RUN` for multi-line config files, use `COPY build-tools/<file>` from the build context. The Meson cross-compilation config lives in `build-tools/cross-android-aarch64.ini` for this reason.
 - **Backend asymmetry is the #1 source of bugs.** QEMU = SLIRP + QMP + virtio-console (TTY); AVF = DHCP + vsock (raw sockets). Test both. The host bridge's `cfmakeraw` on hvc2 (above) is a concrete example.
 - **Boot detection** scans a rolling buffer, not per-read chunks (fast devices split markers).
 - **Bridge stderr is silenced** (`dup2(/dev/null, STDERR)`): it runs as a `TerminalSession` subprocess whose stderr IS the PTY. Never add `fprintf(stderr, ...)` to `podroid-bridge.c`.

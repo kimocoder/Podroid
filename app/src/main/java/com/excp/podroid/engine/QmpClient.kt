@@ -152,16 +152,26 @@ class QmpClient(private val socketPath: String) {
     suspend fun execute(command: String, arguments: JSONObject? = null): Result<JSONObject> =
         exec(command, arguments)
 
-    suspend fun addPortForward(hostPort: Int, guestPort: Int, protocol: String = "tcp"): Result<JSONObject> {
-        val monitorCmd = "hostfwd_add net0 ${protocol}::${hostPort}-:${guestPort}"
+    suspend fun addPortForward(
+        hostPort: Int,
+        guestPort: Int,
+        protocol: String = "tcp",
+        loopbackOnly: Boolean = false,
+    ): Result<JSONObject> {
+        // hostaddr empty = 0.0.0.0; 127.0.0.1 keeps a loopback-only rule off the
+        // network even when applied live (matches the static buildCommand path).
+        val hostAddr = if (loopbackOnly) "127.0.0.1" else ""
+        val monitorCmd = "hostfwd_add net0 ${protocol}:${hostAddr}:${hostPort}-:${guestPort}"
         return execute(
             "human-monitor-command",
             JSONObject().put("command-line", monitorCmd)
         )
     }
 
-    suspend fun removePortForward(hostPort: Int, protocol: String = "tcp"): Result<JSONObject> {
-        val monitorCmd = "hostfwd_remove net0 ${protocol}::${hostPort}"
+    suspend fun removePortForward(hostPort: Int, protocol: String = "tcp", loopbackOnly: Boolean = false): Result<JSONObject> {
+        // hostfwd_remove must match the hostaddr used at add time.
+        val hostAddr = if (loopbackOnly) "127.0.0.1" else ""
+        val monitorCmd = "hostfwd_remove net0 ${protocol}:${hostAddr}:${hostPort}"
         return execute(
             "human-monitor-command",
             JSONObject().put("command-line", monitorCmd)

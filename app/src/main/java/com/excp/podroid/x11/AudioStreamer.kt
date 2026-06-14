@@ -35,6 +35,10 @@ class AudioStreamer(private val host: String = "127.0.0.1") {
         // shifted by 1–3 bytes — the audible result was the clicking the
         // user reported in Firefox video playback.
         private const val BUF_BYTES = 4096
+        // 16-bit stereo = 4 bytes/frame. Any partial-frame write desyncs L/R
+        // for the rest of the stream, so the write loop must never abandon a
+        // chunk mid-frame.
+        private const val FRAME_BYTES = 4
     }
 
     private var job: Job? = null
@@ -117,7 +121,20 @@ class AudioStreamer(private val host: String = "127.0.0.1") {
                                         throw java.io.IOException("AudioTrack.write error $n")
                                     }
                                     n == 0 -> {
-                                        if (++zeroRetries > 8) break  // give up this chunk
+                                        if (++zeroRetries > 8) {
+                                            // Give up this chunk — but only at a frame
+                                            // boundary. Breaking mid-frame would shift
+                                            // every later sample by 1-3 bytes (L/R swap /
+                                            // clicking). If we're mid-frame, rebuild the
+                                            // track instead so the stream realigns cleanly.
+                                            if (off % FRAME_BYTES != 0) {
+                                                Log.v(TAG, "AudioTrack stalled mid-frame; rebuilding to keep alignment")
+                                                track = null
+                                                activeTrack.stop(); activeTrack.release()
+                                                throw java.io.IOException("AudioTrack stalled mid-frame")
+                                            }
+                                            break
+                                        }
                                         delay(5)
                                     }
                                     else -> { off += n; zeroRetries = 0 }

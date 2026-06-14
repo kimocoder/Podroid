@@ -218,9 +218,15 @@ static int cli_notify(int argc, char **argv) {
     char *b64title = title ? b64encode((const unsigned char *)title, strlen(title)) : NULL;
     char *b64body = b64encode((const unsigned char *)body, strlen(body));
     char req[8192];
-    snprintf(req, sizeof(req), "NOTIFY %s %s %s %s",
+    int reqlen = snprintf(req, sizeof(req), "NOTIFY %s %s %s %s",
              prio, id, b64title ? b64title : "-", b64body);
     free(body); free(b64title); free(b64body);
+    /* A body over ~6 KB truncates the base64 mid-string, which the host decodes
+     * as a confusing "bad body". Report a clear error instead. */
+    if (reqlen < 0 || (size_t)reqlen >= sizeof(req)) {
+        fprintf(stderr, "podroid: notification body too long\n");
+        return 2;
+    }
 
     char resp[8192];
     if (cli_roundtrip(req, resp, sizeof(resp)) < 0) {
@@ -325,7 +331,11 @@ static int make_unix_listener(void) {
     sa.sun_family = AF_UNIX;
     strncpy(sa.sun_path, SOCK_PATH, sizeof(sa.sun_path) - 1);
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { close(fd); return -1; }
-    chmod(SOCK_PATH, 0666);
+    /* 0660, not 0666: the socket exposes powerful verbs (POWER stop/restart,
+     * HEADLESS, NOTIFY, OPEN). The daemon and the podroid-* CLIs run as root in
+     * the guest, so owner/group rw is sufficient; world-writable let any guest
+     * UID (incl. processes in containers that bind-mount /run) drive them. */
+    chmod(SOCK_PATH, 0660);
     if (listen(fd, 16) < 0) { close(fd); return -1; }
     return fd;
 }

@@ -25,12 +25,20 @@ import javax.inject.Singleton
  * @param hostPort Port on the Android device
  * @param guestPort Port inside the VM
  * @param protocol "tcp" or "udp"
+ * @param loopbackOnly Bind the host listener to 127.0.0.1 instead of 0.0.0.0.
+ *   Set for the implicit VNC/audio forwards (the in-app viewer dials loopback),
+ *   so an unauthenticated X session + raw PCM aren't exposed to the whole LAN.
+ *   NOT serialized — implicit rules are never persisted; user-created rules keep
+ *   the default (0.0.0.0) so they remain reachable from a PC.
  */
 data class PortForwardRule(
     val hostPort: Int,
     val guestPort: Int,
     val protocol: String = "tcp",
+    val loopbackOnly: Boolean = false,
 ) {
+    // serialize/deserialize intentionally omit loopbackOnly: persistence format
+    // is unchanged (sacred) and only user rules (loopbackOnly=false) persist.
     fun serialize(): String = "$protocol:$hostPort:$guestPort"
 
     companion object {

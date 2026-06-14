@@ -125,24 +125,29 @@ class X11ViewModel @Inject constructor(
                 audio.start(viewModelScope)
                 while (isActive) {
                     val upd = VncClient.readFramebufferUpdate(inp, scratch, fbW, zrle)
-                    upd.newSize?.let { ns ->
-                        if (ns.w != fbW || ns.h != fbH) {
-                            fbW = ns.w; fbH = ns.h
-                            val fresh = IntArray(fbW * fbH)
-                            // Clear damage in the same critical section that swaps the
-                            // framebuffer so a recomposition between resize and the next
-                            // full frame can't blit stale damage rects against the new size.
-                            synchronized(fbLock) { framebuffer = fresh; lastDamage = emptyList() }
-                            scratch = IntArray(fbW * fbH)
-                            _fbSize.value = ns
-                            cursor.value = android.graphics.Point(fbW / 2, fbH / 2)
-                            // Route through the serialized writer so this full-update
-                            // request can't byte-interleave with a concurrent input
-                            // write. Capture the just-resized dimensions explicitly.
-                            val rw = fbW; val rh = fbH
-                            submitRfb { VncClient.requestFramebufferUpdate(it, w = rw, h = rh, incremental = false) }
-                            return@let
-                        }
+                    val ns = upd.newSize
+                    if (ns != null && (ns.w != fbW || ns.h != fbH)) {
+                        fbW = ns.w; fbH = ns.h
+                        val fresh = IntArray(fbW * fbH)
+                        // Clear damage in the same critical section that swaps the
+                        // framebuffer so a recomposition between resize and the next
+                        // full frame can't blit stale damage rects against the new size.
+                        synchronized(fbLock) { framebuffer = fresh; lastDamage = emptyList() }
+                        scratch = IntArray(fbW * fbH)
+                        _fbSize.value = ns
+                        cursor.value = android.graphics.Point(fbW / 2, fbH / 2)
+                        // Route through the serialized writer so this full-update
+                        // request can't byte-interleave with a concurrent input
+                        // write. Capture the just-resized dimensions explicitly.
+                        val rw = fbW; val rh = fbH
+                        submitRfb { VncClient.requestFramebufferUpdate(it, w = rw, h = rh, incremental = false) }
+                        // Skip the rest of this iteration: the old code used
+                        // return@let here, which only exited the let lambda and
+                        // then fell through to overwrite lastDamage with rects
+                        // measured against the OLD geometry (the exact race the
+                        // synchronized block above prevents) and fire a spurious
+                        // incremental request.
+                        continue
                     }
                     synchronized(fbLock) {
                         System.arraycopy(scratch, 0, framebuffer, 0, framebuffer.size)

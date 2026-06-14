@@ -12,7 +12,7 @@ A real Alpine Linux VM with its own kernel - not a chroot or proot trick - so **
 [![Downloads](https://img.shields.io/github/downloads/ExTV/Podroid/total?style=flat-square&color=brightgreen)](https://github.com/ExTV/Podroid/releases)
 [![Stars](https://img.shields.io/github/stars/ExTV/Podroid?style=flat-square&color=yellow)](https://github.com/ExTV/Podroid/stargazers)
 [![License](https://img.shields.io/github/license/ExTV/Podroid?style=flat-square)](LICENSE)
-![Android 9+](https://img.shields.io/badge/Android-9%2B-3DDC84?style=flat-square&logo=android&logoColor=white)
+![Android 8+](https://img.shields.io/badge/Android-8%2B-3DDC84?style=flat-square&logo=android&logoColor=white)
 ![arm64](https://img.shields.io/badge/arch-arm64-orange?style=flat-square)
 
 [**Website**](https://extv.github.io/Podroid/) · [**Documentation**](https://extv.github.io/Podroid/guide/) · [**Download APK**](https://github.com/ExTV/Podroid/releases/latest)
@@ -35,7 +35,7 @@ A real Alpine Linux VM with its own kernel - not a chroot or proot trick - so **
 - **In-app terminal** - full xterm-256color, 122 color themes, 13 fonts, live resize
 - **X11 desktop** - run GUI Linux apps in a built-in viewer with touch, keyboard, mouse and audio
 - **USB passthrough**, **SSH**, **port forwarding** and a **guest-to-Android bridge**
-- **English and 中文**, no root, any arm64 device on Android 9+
+- **English and 中文**, no root, any arm64 device on Android 8+
 
 ## Quick start
 

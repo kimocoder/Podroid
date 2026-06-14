@@ -706,6 +706,13 @@ public final class TerminalEmulator {
         return isDecsetInternalBitSet(DECSET_BIT_APPLICATION_CURSOR_KEYS);
     }
 
+    /** True when the app enabled xterm focus reporting (DECSET 1004). Callers
+     *  must only emit CSI I / CSI O focus events when this is set, or literal
+     *  "^[[I" noise leaks into a shell that didn't ask for it. */
+    public boolean isFocusEventsEnabled() {
+        return isDecsetInternalBitSet(DECSET_BIT_SEND_FOCUS_EVENTS);
+    }
+
     /** If mouse events are being sent as escape codes to the terminal. */
     public boolean isMouseTrackingActive() {
         return isDecsetInternalBitSet(DECSET_BIT_MOUSE_TRACKING_PRESS_RELEASE) || isDecsetInternalBitSet(DECSET_BIT_MOUSE_TRACKING_BUTTON_EVENT);

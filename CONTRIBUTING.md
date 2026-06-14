@@ -16,7 +16,7 @@ You will need:
 - **Docker 20.10+** for the kernel, initramfs, rootfs, and QEMU build pipelines
 - **Android NDK r27c** for the bridge and Termux native libraries
 - **Android SDK** with platform 36 + build-tools
-- An **arm64 Android device** running **Android 9.0+ (API 28)** for testing
+- An **arm64 Android device** running **Android 8.0+ (API 26)** for testing
 
 ## Build pipeline
 
@@ -79,6 +79,8 @@ Podroid/
 ├── init-podroid                          Minimal initramfs script (~45 lines)
 ├── podroid-bridge.c                      Native PTY ↔ virtio-console relay
 ├── Dockerfile                            Kernel + initramfs + QEMU build pipeline
+├── build-tools/                          Static assets used during Docker builds
+│   └── cross-android-aarch64.ini         Meson cross-compilation config for aarch64-android26
 ├── build-rootfs/                         Alpine squashfs build pipeline
 │   ├── Dockerfile.rootfs
 │   ├── build-rootfs.sh

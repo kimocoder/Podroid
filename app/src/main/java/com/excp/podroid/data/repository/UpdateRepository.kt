@@ -159,8 +159,16 @@ class UpdateRepository @Inject constructor(
             // 1.1.7-debug compares equal to the 1.1.7 release tag instead of "older".
             val normalizedCurrent = currentVersion.removeSuffix("-debug")
             if (isNewer(tag, normalizedCurrent)) UpdateInfo(tag, url) else null
-        } catch (_: Exception) {
-            // Network/DataStore error: still record the timestamp to back off on the next launch.
+        } catch (c: kotlinx.coroutines.CancellationException) {
+            // Coroutine cancellation is not a check failure — don't record a
+            // timestamp (which would back off a check the user may retry) and
+            // don't swallow it; let it propagate.
+            throw c
+        } catch (e: Exception) {
+            // Network/DataStore/JSON error: log it (a changed GitHub response or
+            // JSON shape was previously failing invisibly) and still record the
+            // timestamp to back off on the next launch.
+            android.util.Log.w("UpdateRepository", "update check failed", e)
             runCatching { context.dataStore.edit { it[lastCheckKey] = now } }
             null
         } finally {
@@ -169,7 +177,11 @@ class UpdateRepository @Inject constructor(
     }
 
     suspend fun isDismissed(version: String): Boolean {
-        val dismissed = context.dataStore.data.first()[dismissedKey]
+        // Shield the read so a corrupted store returns "not dismissed" instead of
+        // throwing into the caller.
+        val dismissed = context.dataStore.data
+            .catch { e -> if (e is java.io.IOException) emit(emptyPreferences()) else throw e }
+            .first()[dismissedKey]
         return dismissed == version
     }
 
