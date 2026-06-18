@@ -1,0 +1,3 @@
+## 2025-05-15 - ZRLE Decoder Architectural Optimization
+**Learning:** In mobile/Android ARM environments, integer division and modulo in tight graphics loops are significant bottlenecks. Combining this with per-rectangle object allocation and small (4KB) decompression buffers limits the throughput of X11/VNC rendering.
+**Action:** Always optimize RLE loops by using incremental counters instead of division/modulo, use at least 16KB buffers for JNI-bridged zlib operations, and use java.util.Arrays.fill for bulk pixel spans. Inlining stream helper classes into the main decoder eliminates allocation overhead for high-frequency rectangle updates.
