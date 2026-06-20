@@ -161,7 +161,13 @@ class X11ViewModel @Inject constructor(
                     submitRfb { VncClient.requestFramebufferUpdate(it, w = fbW, h = fbH, incremental = true) }
                 }
             } catch (e: Exception) {
-                _connection.value = X11ConnectionState.Failed(e.message ?: "unknown")
+                // A user-initiated disconnect() cancels this job and closes the
+                // socket, which surfaces here as a SocketException; that is not a
+                // failure, so only report Failed when the job is still active (a
+                // genuine read/connect error). Cancellation flips isActive false
+                // before the close lands, so the finally falls through to
+                // Disconnected instead.
+                if (isActive) _connection.value = X11ConnectionState.Failed(e.message ?: "unknown")
             } finally {
                 rfbOut = null
                 rfbSocket = null
@@ -190,6 +196,17 @@ class X11ViewModel @Inject constructor(
         heldButtons = 0
         sessionJob?.cancel()
         sessionJob = null
+        // Coroutine cancellation can't interrupt the blocking native socket read
+        // in connect()'s read loop, so on an idle desktop (no framebuffer updates
+        // arriving to unblock readFully) the read parks forever and the finally
+        // that closes the socket, stops audio, and resets state never runs —
+        // leaking the socket, its IO thread, and the audio stream on every screen
+        // exit. Force-close the socket so the read throws and the finally runs.
+        // Queued on the serialized writer AFTER the button-up above so that release
+        // still flushes first; this is the same path connect()'s finally uses.
+        // onDispose() calls disconnect() while the ViewModel scope is still alive
+        // (onCleared runs later), so this executes.
+        rfbSocket?.let { sock -> viewModelScope.launch(rfbDispatcher) { runCatching { sock.close() } } }
     }
 
     @Volatile private var lastViewportW = 0
