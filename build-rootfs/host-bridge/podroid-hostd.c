@@ -370,7 +370,11 @@ static int daemon_main(void) {
         if (cli < 0) { if (errno == EINTR) continue; break; }
 
         char req[8192];
-        int rn = read_line(cli, req, sizeof(req));
+        /* Bound the CLI read: a guest process that connects but never sends a
+         * newline would otherwise wedge this single-threaded loop forever and
+         * hang every other podroid-* call. The host channel below already uses
+         * the same timeout; the CLI side must too. */
+        int rn = read_line_timeout(cli, req, sizeof(req), HOST_TIMEOUT_S);
         if (rn <= 0) { close(cli); continue; }
 
         if (host_fd < 0) {
