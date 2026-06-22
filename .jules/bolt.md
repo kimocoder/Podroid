@@ -1,0 +1,3 @@
+## 2025-05-15 - ZRLE Decoder Optimization
+**Learning:** On Android/ARM, integer division and modulo in tight graphics loops are significantly slower than incremental counters. Additionally, JNI overhead for zlib decompression can be minimized by using larger (16KB) buffers to reduce the number of transitions. Bulk memory operations like `Arrays.fill` provide substantial speedups over per-pixel loops.
+**Action:** Always replace `/` and `%` with stateful counters in image decoding loops. Use 16KB buffers for native stream processing. Leverage `Arrays.fill` or `System.arraycopy` for contiguous data segments.
