@@ -1,0 +1,3 @@
+## 2026-06-23 - Optimize ZRLE decoding performance
+**Learning:** In hot loops like ZRLE tile decoding, integer division (/) and modulo (%) are significant bottlenecks on mobile ARM architectures. Replacing them with incremental row/column counters and using native bulk operations like `java.util.Arrays.fill` for RLE spans significantly improves throughput. Additionally, sizing Zlib decompression buffers to 16KB+ minimizes JNI transition overhead between the JVM and the native Inflater.
+**Action:** Always prefer incremental counters and bulk memory operations over coordinate arithmetic in pixel-processing loops. Ensure buffers used for native library interactions are large enough to amortize JNI call costs.
