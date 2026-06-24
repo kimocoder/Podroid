@@ -1,0 +1,3 @@
+## 2025-05-22 - Optimized ZRLE decoding with bulk operations and coordinate tracking
+**Learning:** On mobile ARM architectures (Android), integer division (`/`) and modulo (`%`) inside tight graphics loops are significant performance bottlenecks. Additionally, small zlib decompression buffers (e.g., 256 bytes or 4KB) lead to excessive JNI transition overhead between the JVM and the native `Inflater`.
+**Action:** Replace coordinate arithmetic with incremental counters in RLE loops and use `java.util.Arrays.fill` for bulk pixel spans. Standardize on 16KB+ buffers for decompression to minimize JNI overhead.
