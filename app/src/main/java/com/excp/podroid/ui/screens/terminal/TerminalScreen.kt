@@ -502,6 +502,30 @@ private fun TerminalSurface(
             update = { },
             modifier = Modifier.fillMaxSize(),
         )
+
+        // Auto-reconnect gave up (the bridge kept dying): stop respawning it and
+        // let the user re-trigger a connection by tapping. Cleared on retry or a
+        // fresh VM run (see TerminalViewModel.reconnectExhausted).
+        val reconnectExhausted by viewModel.reconnectExhausted.collectAsStateWithLifecycle()
+        if (reconnectExhausted) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.55f))
+                    .clickable { viewModel.retryConnection() },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = stringResource(R.string.terminal_disconnected_tap_retry),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier
+                        .background(MaterialTheme.colorScheme.errorContainer, MaterialTheme.shapes.medium)
+                        .padding(horizontal = 20.dp, vertical = 14.dp),
+                )
+            }
+        }
     }
 }
 
@@ -828,7 +852,8 @@ private fun QuickSettingsDialog(
                                 if (rounded != fontSize) onFontSizeChange(rounded)
                             },
                             onValueChangeFinished = onDismiss,
-                            valueRange = 10f..36f,
+                            // Shared with pinch-to-zoom so the two can't disagree.
+                            valueRange = TerminalViewModel.MIN_FONT_SIZE.toFloat()..TerminalViewModel.MAX_FONT_SIZE.toFloat(),
                             modifier = Modifier.weight(1f),
                         )
                         Text(

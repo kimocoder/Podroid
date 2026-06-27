@@ -146,6 +146,7 @@
     <string name="terminal_title">终端</string>
     <string name="vm_not_running_hint">请先从主屏幕启动虚拟机。</string>
     <string name="back_to_home">返回主屏幕</string>
+    <string name="terminal_disconnected_tap_retry">已断开连接。点按以重新连接。</string>
 
     <!-- Terminal Quick Settings -->
     <string name="display_section">显示</string>
