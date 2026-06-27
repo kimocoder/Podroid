@@ -848,7 +848,11 @@ class AvfEngine @Inject constructor(
             java.io.RandomAccessFile(storageFile, "rw").use { it.setLength(desiredBytes) }
             Log.d(TAG, "Created storage.img (${storageSizeGb}GB)")
         } catch (e: Exception) {
+            // Don't swallow + boot a 0-byte image into an opaque early-boot stop.
+            // Rethrow so start()'s catch surfaces a clear storage error.
             Log.e(TAG, "Failed to create storage.img", e)
+            runCatching { storageFile.delete() }
+            throw java.io.IOException("Couldn't create the ${storageSizeGb} GB VM disk image: ${e.message}", e)
         }
         return storageFile
     }

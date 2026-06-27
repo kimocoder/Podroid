@@ -120,7 +120,14 @@ class QemuEngine @Inject constructor(
     /** Per-run serial monitor; created in start(), released in cleanup(). */
     private var bootMonitor: QemuBootMonitor? = null
 
-    private val bootStageDetector = BootStageDetector(_bootStage, _state) {
+    /**
+     * Fresh detector per run (see start()) rather than one reused instance.
+     * The previous run's boot monitor may still be draining when start() runs
+     * (cleanup cancels but does not join it); a shared instance let that stale
+     * feed race the new run's scan offsets / one-shot guard. A new instance per
+     * run isolates each boot. Mirrors the AVF backend, which already does this.
+     */
+    private fun newBootStageDetector() = BootStageDetector(_bootStage, _state) {
         // BootStageDetector has already flipped _state to Running by the time
         // this onReady fires; stamp the uptime origin to match.
         _runningSinceMs = System.currentTimeMillis()
@@ -273,14 +280,22 @@ class QemuEngine @Inject constructor(
             return
         }
 
-        ensureStorageImage(config.storageSizeGb)
+        try {
+            ensureStorageImage(config.storageSizeGb)
+        } catch (e: java.io.IOException) {
+            // Restore the "cleanedUp=false ⟺ VM lifetime in progress" invariant
+            // (same as the qemuExecutable() path); no process/scope exists yet.
+            cleanedUp.set(true)
+            bootStartTime = 0L
+            _state.value = VmState.Error(e.message ?: "Could not prepare the VM disk image.")
+            return
+        }
 
         _consoleText.value = ""
         _bootStage.value = "Starting QEMU..."
-        // Re-arm the one-shot detector so a Stop → Start cycle's second boot
-        // can fire onReady again. Without this the new boot's "Ready!" marker
-        // is silently ignored and state stays Starting forever.
-        bootStageDetector.reset()
+        // Fresh per-run detector so a previous run's still-draining monitor can't
+        // feed (or race the one-shot guard / scan offsets of) this run's detector.
+        val detector = newBootStageDetector()
 
         // Clean up stale sockets from a previous run. qmp.sock must be
         // included — a leftover file from a crashed QEMU prevents the new
@@ -298,6 +313,12 @@ class QemuEngine @Inject constructor(
             val nativeDir = context.applicationInfo.nativeLibraryDir
             val pb = ProcessBuilder(cmd).directory(context.filesDir)
             pb.environment()["LD_LIBRARY_PATH"] = "$nativeDir:${context.filesDir.absolutePath}"
+            // Discard QEMU's stdout. Nothing routes there today (serial/QMP use
+            // sockets), but user extra args like `-monitor stdio` could, and an
+            // unread OS pipe would fill its buffer and deadlock the VM. Redirect
+            // to /dev/null rather than merging into stderr, which feeds error
+            // formatting (recordStderr below). Redirect.DISCARD would need API 33.
+            pb.redirectOutput(File("/dev/null"))
 
             // Fork QEMU on a private, long-lived thread (see qemuDispatcher).
             // PR_SET_PDEATHSIG (set by libpodroid-launcher) is thread-scoped, so
@@ -335,7 +356,7 @@ class QemuEngine @Inject constructor(
             // streams the guest console into console.log + the boot-stage detector.
             val monitor = QemuBootMonitor(
                 serialSockPath, File(context.filesDir, "console.log"),
-                bootStageDetector, _consoleText, SOCKET_READY_TIMEOUT_MS,
+                detector, _consoleText, SOCKET_READY_TIMEOUT_MS,
             )
             bootMonitor = monitor
             monitor.connectAndRun(scope) { proc.isAlive }
@@ -679,7 +700,12 @@ class QemuEngine @Inject constructor(
             java.io.RandomAccessFile(storageFile, "rw").use { it.setLength(desiredBytes) }
             Log.d(TAG, "Created storage.img (${storageSizeGb}GB)")
         } catch (e: Exception) {
+            // Don't swallow: a 0-byte / missing storage.img would otherwise boot
+            // into an opaque early-boot stop. Surface it so start() can report a
+            // clear storage error (mirrors the AVF disk-create path).
             Log.e(TAG, "Failed to create storage.img", e)
+            runCatching { storageFile.delete() }
+            throw java.io.IOException("Couldn't create the ${storageSizeGb} GB VM disk image: ${e.message}", e)
         }
     }
 
