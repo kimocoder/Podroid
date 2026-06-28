@@ -212,11 +212,20 @@ static int cli_notify(int argc, char **argv) {
     if (i >= argc) { fprintf(stderr, "usage: podroid-notify [--title T] [--priority low|normal|high] [--id N] BODY\n"); return 2; }
     size_t blen = 0;
     for (int j = i; j < argc; j++) blen += strlen(argv[j]) + 1;
-    char *body = malloc(blen + 1); body[0] = '\0';
+    char *body = malloc(blen + 1);
+    if (!body) { fprintf(stderr, "podroid: out of memory\n"); return 1; }
+    body[0] = '\0';
     for (int j = i; j < argc; j++) { if (j > i) strcat(body, " "); strcat(body, argv[j]); }
 
     char *b64title = title ? b64encode((const unsigned char *)title, strlen(title)) : NULL;
     char *b64body = b64encode((const unsigned char *)body, strlen(body));
+    /* b64body is required; a NULL (allocation failure) must not reach snprintf's
+     * %s. The title is optional and already falls back to the "-" sentinel. */
+    if (!b64body) {
+        fprintf(stderr, "podroid: out of memory\n");
+        free(body); free(b64title);
+        return 1;
+    }
     char req[8192];
     int reqlen = snprintf(req, sizeof(req), "NOTIFY %s %s %s %s",
              prio, id, b64title ? b64title : "-", b64body);

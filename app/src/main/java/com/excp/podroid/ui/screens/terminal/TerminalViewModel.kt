@@ -97,6 +97,37 @@ class TerminalViewModel @Inject constructor(
     private val _reconnectSignal = kotlinx.coroutines.flow.MutableStateFlow(0)
     val reconnectSignal: StateFlow<Int> = _reconnectSignal
 
+    // True once auto-reconnect has hit its cap and given up; the screen surfaces
+    // a "tap to reconnect" affordance that calls retryConnection().
+    private val _reconnectExhausted = kotlinx.coroutines.flow.MutableStateFlow(false)
+    val reconnectExhausted: StateFlow<Boolean> = _reconnectExhausted
+
+    // Auto-reconnect governor state (see onSessionFinished + companion bounds).
+    private var reconnectAttempts = 0
+    private var reconnectWindowStartMs = 0L
+
+    init {
+        // Each fresh VM run starts with a clean governor, and a stale "exhausted"
+        // from a previous run is cleared so the new run's session attaches.
+        viewModelScope.launch {
+            engine.state.collect { st ->
+                if (st !is VmState.Running) {
+                    reconnectAttempts = 0
+                    reconnectWindowStartMs = 0L
+                    _reconnectExhausted.value = false
+                }
+            }
+        }
+    }
+
+    /** Manual reconnect after auto-reconnect gave up (see [reconnectExhausted]). */
+    fun retryConnection() {
+        reconnectAttempts = 0
+        reconnectWindowStartMs = System.currentTimeMillis()
+        _reconnectExhausted.value = false
+        _reconnectSignal.value += 1
+    }
+
     // Quick settings helpers (non-persistent)
     fun openQuickSettings() { _showQuickSettings.value = true }
     fun closeQuickSettings() { _showQuickSettings.value = false }
@@ -110,9 +141,19 @@ class TerminalViewModel @Inject constructor(
         viewModelScope.launch { settingsRepository.setHapticsEnabled(value) }
     }
 
+    // Synchronous mirror of the persisted font size so a fast pinch gesture steps
+    // from the value it just set rather than the DataStore-backed StateFlow, which
+    // hasn't committed yet (reading it on every callback collapsed several
+    // intended steps into one). -1 until the first write seeds it.
+    private var liveFontSize: Int = -1
+
     fun setTerminalFontSize(value: Int) {
+        // Clamp here so pinch and the slider (which share MIN/MAX_FONT_SIZE) can
+        // never persist a size the other surface would snap away from.
+        val clamped = value.coerceIn(MIN_FONT_SIZE, MAX_FONT_SIZE)
+        liveFontSize = clamped
         viewModelScope.launch {
-            settingsRepository.setTerminalFontSize(value)
+            settingsRepository.setTerminalFontSize(clamped)
         }
     }
 
@@ -499,8 +540,25 @@ class TerminalViewModel @Inject constructor(
             // dead session and reconnect so the user isn't stranded on a
             // "[Process completed]" buffer. On a real VM shutdown vmState is no
             // longer Running, so we leave teardown to the normal path.
-            if (vmState.value is VmState.Running) {
+            if (vmState.value !is VmState.Running) return
+            if (_reconnectExhausted.value) return  // waiting on a manual retry
+
+            // Governor: a chardev that accepts the connection then immediately
+            // EOFs would otherwise respawn the bridge (process + threads) many
+            // times per second. Reset the burst window once enough time has
+            // passed that the last session was plausibly healthy; a tight failure
+            // loop stays inside the window, trips the cap, and falls back to a
+            // manual "tap to reconnect" instead of looping forever.
+            val now = System.currentTimeMillis()
+            if (now - reconnectWindowStartMs > RECONNECT_WINDOW_MS) {
+                reconnectWindowStartMs = now
+                reconnectAttempts = 0
+            }
+            if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                reconnectAttempts++
                 _reconnectSignal.value += 1
+            } else {
+                _reconnectExhausted.value = true
             }
         }
         override fun onCopyTextToClipboard(session: TerminalSession, text: String?) {
@@ -545,9 +603,15 @@ class TerminalViewModel @Inject constructor(
         // canonical pattern). Below the threshold we pass it through unchanged.
         override fun onScale(scale: Float): Float {
             if (scale < 0.9f || scale > 1.1f) {
+                // Step from the synchronous mirror, not the lagging StateFlow, so
+                // rapid callbacks within one gesture don't all read the same stale
+                // value and collapse multiple steps into one. Falls back to the
+                // persisted value until the first write seeds liveFontSize.
+                val base = liveFontSize.takeIf { it in MIN_FONT_SIZE..MAX_FONT_SIZE }
+                    ?: terminalFontSize.value
                 val step = if (scale < 1f) -1 else 1
-                val next = (terminalFontSize.value + step).coerceIn(MIN_FONT_SIZE, MAX_FONT_SIZE)
-                if (next != terminalFontSize.value) setTerminalFontSize(next)
+                val next = (base + step).coerceIn(MIN_FONT_SIZE, MAX_FONT_SIZE)
+                if (next != base) setTerminalFontSize(next)
                 return 1.0f
             }
             return scale
@@ -639,12 +703,23 @@ class TerminalViewModel @Inject constructor(
         override fun readFnKey(): Boolean = false
 
         override fun onCodePoint(codePoint: Int, ctrlDown: Boolean, session: TerminalSession?): Boolean {
-            val bytes: ByteArray
-            if ((ctrlDown || extraCtrl) && codePoint in 64..127) {
-                bytes = byteArrayOf((codePoint and 0x1f).toByte())
+            val ctrl = ctrlDown || extraCtrl
+            // We only transform the canonical Ctrl range (64..127: Ctrl+@, Ctrl+A..Z,
+            // Ctrl+[ \ ] ^ _). For any other Ctrl combination — most importantly
+            // Ctrl+Space, which must emit NUL (readline set-mark, Emacs C-Space) —
+            // return false so TerminalView applies its canonical sub-64 control
+            // mapping instead of us writing the raw code point and swallowing it.
+            // extraCtrl is left set: when the Ctrl came from the on-screen sticky
+            // key (not a hardware modifier) the view reads it back via readControlKey().
+            if (ctrl && codePoint !in 64..127) {
+                extraAlt = false
+                return false
+            }
+            val bytes: ByteArray = if (ctrl) {
+                byteArrayOf((codePoint and 0x1f).toByte())
             } else {
                 val charBytes = String(Character.toChars(codePoint)).toByteArray(Charsets.UTF_8)
-                bytes = if (extraAlt) byteArrayOf(27) + charBytes else charBytes
+                if (extraAlt) byteArrayOf(27) + charBytes else charBytes
             }
             session?.write(bytes, 0, bytes.size)
             extraCtrl = false
@@ -770,9 +845,16 @@ class TerminalViewModel @Inject constructor(
 
     companion object {
         private const val TAG = "TerminalVM"
-        // Pinch-to-zoom font bounds (px). Matches the practical terminal range;
-        // keep in sync with the Quick Settings font slider.
-        private const val MIN_FONT_SIZE = 8
-        private const val MAX_FONT_SIZE = 48
+        // Font-size bounds (px), shared by BOTH pinch-to-zoom and the Quick
+        // Settings slider (TerminalScreen reads these) so the two surfaces can't
+        // disagree — the slider would otherwise snap away a size pinch persisted.
+        internal const val MIN_FONT_SIZE = 8
+        internal const val MAX_FONT_SIZE = 48
+        // Dead-session auto-reconnect governor: at most MAX_RECONNECT_ATTEMPTS
+        // re-attaches within RECONNECT_WINDOW_MS before falling back to a manual
+        // "tap to reconnect", so a chardev that accepts-then-EOFs can't respawn
+        // the bridge many times per second.
+        private const val MAX_RECONNECT_ATTEMPTS = 5
+        private const val RECONNECT_WINDOW_MS = 10_000L
     }
 }

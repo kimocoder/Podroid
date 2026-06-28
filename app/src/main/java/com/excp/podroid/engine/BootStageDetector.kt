@@ -35,18 +35,6 @@ class BootStageDetector(
     private var scannedLen = 0
     private var ready = false
 
-    /**
-     * Reset the one-shot guard + buffer. Called by engines at the start of
-     * each VM run so a Stop → Start cycle's second boot can re-fire onReady.
-     * Without this, the detector silently ignores the new boot stream because
-     * `ready=true` from the previous run, and state stays Starting forever.
-     */
-    fun reset() {
-        ready = false
-        buf.clear()
-        scannedLen = 0
-    }
-
     fun feed(bytes: ByteArray, len: Int) {
         if (ready) return
         // Latin-1 decode is byte-safe (1 byte → 1 char) and the ASCII subset

@@ -27,6 +27,8 @@ object AvfReflect {
     private val CUSTOM by lazy { Class.forName("$PKG.VirtualMachineCustomImageConfig") }
     private val CUSTOM_B by lazy { Class.forName("$PKG.VirtualMachineCustomImageConfig\$Builder") }
     private val DISK by lazy { runCatching { Class.forName("$PKG.VirtualMachineCustomImageConfig\$Disk") }.getOrNull() }
+    private val GPU by lazy { runCatching { Class.forName("$PKG.VirtualMachineCustomImageConfig\$GpuConfig") }.getOrNull() }
+    private val GPU_B by lazy { runCatching { Class.forName("$PKG.VirtualMachineCustomImageConfig\$GpuConfig\$Builder") }.getOrNull() }
 
     fun manager(ctx: Context): Any {
         val m = Context::class.java.getMethod("getSystemService", Class::class.java)
@@ -460,6 +462,39 @@ object AvfReflect {
         val ok = runCatching { invokeDecl(b, "useNetwork", Boolean::class.javaPrimitiveType!! to value) }.isSuccess
             || runCatching { invokeDecl(b, "setNetworkSupported", Boolean::class.javaPrimitiveType!! to value) }.isSuccess
         if (!ok) android.util.Log.w("AvfReflect", "no useNetwork/setNetworkSupported on this AVF API; VM may have no network")
+    }
+
+    /**
+     * Attaches a minimal headless virtio-GPU (backend=2d, surfaceless; NO
+     * DisplayConfig, so no display surface is required) to the custom-image
+     * builder. The purpose is crosvm BINARY SELECTION, not graphics.
+     *
+     * On Pixel's `com.google.android.virt` APEX, virtmgr runs GPU-less VMs on
+     * `/apex/com.android.virt/bin/crosvm_minimal`, which is built WITHOUT the
+     * `net` feature. virtmgr still appends `--net tap-fd=N` when networking is
+     * requested, so the minimal binary aborts at arg-parse ("Unrecognized
+     * argument: --net", exit 35) and the VM never boots. The full `crosvm` has
+     * `net`. Google's own Terminal app never hits this because it always declares
+     * a GPU; declaring one here routes us onto the same net-capable binary.
+     *
+     * Returns true if a GPU was attached. No-op (returns false) on AVF revisions
+     * that predate the GpuConfig API — those use the full crosvm already, so a
+     * headless networked VM is unaffected.
+     */
+    fun setGpuConfig(b: Any): Boolean = runCatching {
+        val gpuBuilderCls = GPU_B ?: return false
+        val gpuCls = GPU ?: return false
+        val gpuB = gpuBuilderCls.getDeclaredConstructor().apply { isAccessible = true }.newInstance()
+        invokeDecl(gpuB, "setBackend", String::class.java to "2d")
+        // Surfaceless keeps the virtio-GPU off any scanout/window; harmless if the
+        // API revision ignores it (wrapped so a missing setter is not fatal).
+        runCatching { invokeDecl(gpuB, "setRendererUseSurfaceless", Boolean::class.javaPrimitiveType!! to true) }
+        val gpu = invokeDecl(gpuB, "build") ?: return false
+        invokeDecl(b, "setGpuConfig", gpuCls to gpu)
+        true
+    }.getOrElse { e ->
+        android.util.Log.w("AvfReflect", "setGpuConfig unavailable on this AVF API (continuing without GPU)", e)
+        false
     }
 
     /**

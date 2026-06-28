@@ -172,9 +172,9 @@ object AvfDiagnostics {
         if (!pre.customPermissionGranted) return "skipped: USE_CUSTOM_VIRTUAL_MACHINE not granted (run: adb shell pm grant ${context.packageName} $PERM_CUSTOM)"
         if (!pre.managerClassPresent) return "FAILED: $CLS_MANAGER not on the boot classpath — system stub missing"
 
-        val kernel = File(context.filesDir, "vmlinuz-virt")
+        val kernelSrc = File(context.filesDir, "vmlinuz-virt")
         val initrd = File(context.filesDir, "initrd.img")
-        if (!kernel.exists()) return "FAILED: kernel not extracted yet at ${kernel.absolutePath}"
+        if (!kernelSrc.exists()) return "FAILED: kernel not extracted yet at ${kernelSrc.absolutePath}"
         if (!initrd.exists()) return "FAILED: initrd not extracted yet at ${initrd.absolutePath}"
 
         if (AvfCapabilities.choose(pre.capabilitiesRaw) is AvfCapabilities.ProtectedVmChoice.Unsupported) {
@@ -188,6 +188,11 @@ object AvfDiagnostics {
             val vmm = getVirtualizationManager(context)
                 ?: return "FAILED: VirtualMachineManager system service returned null"
 
+            // crosvm needs the raw ARM64 Image, not the gzip vmlinuz — decompress
+            // exactly like AvfEngine.ensureRawKernel (and reuse its cached .raw).
+            // Without this, crosvm fails to load the kernel ("invalid magic
+            // number") the moment it gets past arg parsing.
+            val kernel = ensureRawKernel(kernelSrc)
             val customCfg = buildCustomImageConfig(kernel.absolutePath, initrd.absolutePath)
             val config = buildVirtualMachineConfig(vmm, context, customCfg)
 
@@ -233,6 +238,25 @@ object AvfDiagnostics {
         val mgrCls = Class.forName(CLS_MANAGER)
         val m = Context::class.java.getMethod("getSystemService", Class::class.java)
         return m.invoke(context, mgrCls)
+    }
+
+    /**
+     * Mirrors AvfEngine.ensureRawKernel: crosvm requires the raw ARM64 Image
+     * (magic `ARM\x64` at 0x38), not the gzip-compressed vmlinuz. Decompress to
+     * the same sibling `.raw` file so the cache is shared with the real VM path.
+     * Returns the source untouched if it isn't gzip.
+     */
+    private fun ensureRawKernel(source: File): File {
+        val magic = ByteArray(4)
+        source.inputStream().use { it.read(magic) }
+        if (magic[0] != 0x1f.toByte() || magic[1] != 0x8b.toByte()) return source
+        val raw = File(source.parentFile, "${source.name}.raw")
+        if (raw.exists() && raw.lastModified() >= source.lastModified()) return raw
+        java.util.zip.GZIPInputStream(source.inputStream().buffered()).use { gz ->
+            raw.outputStream().buffered().use { out -> gz.copyTo(out) }
+        }
+        raw.setLastModified(System.currentTimeMillis())
+        return raw
     }
 
     private fun buildCustomImageConfig(kernelPath: String, initrdPath: String): Any {
