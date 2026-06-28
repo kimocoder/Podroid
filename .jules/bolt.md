@@ -1,0 +1,3 @@
+## 2025-05-15 - ZRLE Decoder Optimization
+**Learning:** On mobile ARM architectures (Android), graphics decoding performance is heavily impacted by JVM/Native transition overhead and inefficient pixel-by-pixel loops. Increasing zlib buffers to 16KB and leveraging `java.util.Arrays.fill` (which maps to native `memset`) provides significant speedups. Additionally, avoiding integer division and modulo in tight loops by using incremental counters prevents CPU-intensive arithmetic bottlenecks.
+**Action:** Always look for bulk memory operations (like `Arrays.fill`) and fast-path buffer reads when dealing with stream-based decoding. Ensure zlib-related buffers are at least 16KB to minimize JNI overhead.
