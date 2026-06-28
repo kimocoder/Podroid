@@ -43,9 +43,8 @@ class ZrleDecoder {
     }
 
     // Scratch buffer for compressed input read from the socket.
-    private var inputScratch = ByteArray(4096)
-    // Decompressed output buffer; re-used across inflate calls within one decode() call.
-    private var outputBuf = ByteArray(4096)
+    // 16KB reduces JNI transitions between JVM and native Inflater on large rects.
+    private var inputScratch = ByteArray(16384)
 
     // Remaining compressed bytes in the current rect that have not yet been fed to the inflater.
     private var remaining = 0
@@ -126,8 +125,7 @@ class ZrleDecoder {
                 // Solid: 1 CPIXEL, fill the whole tile.
                 val color = zi.readCpixel()
                 for (row in 0 until th) {
-                    val base = (ty + row) * stride + tx
-                    for (col in 0 until tw) target[base + col] = color
+                    java.util.Arrays.fill(target, (ty + row) * stride + tx, (ty + row) * stride + tx + tw, color)
                 }
             }
             subenc in 2..16 -> {
@@ -169,14 +167,18 @@ class ZrleDecoder {
                 var filled = 0
                 while (filled < total) {
                     val color = zi.readCpixel()
-                    val runLen = zi.readRunLength()
+                    var runLen = zi.readRunLength()
                     if (filled + runLen > total) throw IOException("ZRLE: plain RLE run overruns tile ($filled+$runLen > $total)")
-                    repeat(runLen) {
-                        val pos = filled + it
-                        val row = pos / tw; val col = pos % tw
-                        target[(ty + row) * stride + (tx + col)] = color
-                    }
+                    var currRow = filled / tw
+                    var currCol = filled % tw
                     filled += runLen
+                    while (runLen > 0) {
+                        val n = minOf(runLen, tw - currCol)
+                        java.util.Arrays.fill(target, (ty + currRow) * stride + tx + currCol, (ty + currRow) * stride + tx + currCol + n, color)
+                        runLen -= n
+                        currRow++
+                        currCol = 0
+                    }
                 }
             }
             subenc in 130..255 -> {
@@ -190,23 +192,25 @@ class ZrleDecoder {
                     if (indexByte and 0x80 == 0) {
                         // Single pixel.
                         if (indexByte >= n) throw IOException("ZRLE: palette RLE index $indexByte >= $n")
-                        val pos = filled
-                        val row = pos / tw; val col = pos % tw
-                        target[(ty + row) * stride + (tx + col)] = palette[indexByte]
+                        target[(ty + filled / tw) * stride + (tx + filled % tw)] = palette[indexByte]
                         filled++
                     } else {
                         // Run of palette[index & 0x7F].
                         val idx = indexByte and 0x7F
                         if (idx >= n) throw IOException("ZRLE: palette RLE index $idx >= $n")
                         val color = palette[idx]
-                        val runLen = zi.readRunLength()
+                        var runLen = zi.readRunLength()
                         if (filled + runLen > total) throw IOException("ZRLE: palette RLE run overruns tile ($filled+$runLen > $total)")
-                        repeat(runLen) {
-                            val pos = filled + it
-                            val row = pos / tw; val col = pos % tw
-                            target[(ty + row) * stride + (tx + col)] = color
-                        }
+                        var currRow = filled / tw
+                        var currCol = filled % tw
                         filled += runLen
+                        while (runLen > 0) {
+                            val chunk = minOf(runLen, tw - currCol)
+                            java.util.Arrays.fill(target, (ty + currRow) * stride + tx + currCol, (ty + currRow) * stride + tx + currCol + chunk, color)
+                            runLen -= chunk
+                            currRow++
+                            currCol = 0
+                        }
                     }
                 }
             }
@@ -219,7 +223,8 @@ class ZrleDecoder {
      * The inflater's input was already loaded by [decode]; this just drains output.
      */
     private inner class ZInput(private val inf: Inflater) {
-        private val buf = ByteArray(256)
+        // 16KB decompressed output buffer reduces JNI transition overhead.
+        private val buf = ByteArray(16384)
         private var pos = 0
         private var avail = 0
 
@@ -253,6 +258,15 @@ class ZrleDecoder {
 
         /** Read 3-byte CPIXEL (B, G, R) and return as ARGB int. */
         fun readCpixel(): Int {
+            if (avail >= 3) {
+                // Optimization: direct read from buffer when enough bytes are available.
+                val b = buf[pos].toInt() and 0xFF
+                val g = buf[pos + 1].toInt() and 0xFF
+                val r = buf[pos + 2].toInt() and 0xFF
+                pos += 3
+                avail -= 3
+                return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+            }
             val b = readByte()
             val g = readByte()
             val r = readByte()
