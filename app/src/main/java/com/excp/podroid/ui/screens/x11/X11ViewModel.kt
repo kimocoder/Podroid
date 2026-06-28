@@ -125,24 +125,29 @@ class X11ViewModel @Inject constructor(
                 audio.start(viewModelScope)
                 while (isActive) {
                     val upd = VncClient.readFramebufferUpdate(inp, scratch, fbW, zrle)
-                    upd.newSize?.let { ns ->
-                        if (ns.w != fbW || ns.h != fbH) {
-                            fbW = ns.w; fbH = ns.h
-                            val fresh = IntArray(fbW * fbH)
-                            // Clear damage in the same critical section that swaps the
-                            // framebuffer so a recomposition between resize and the next
-                            // full frame can't blit stale damage rects against the new size.
-                            synchronized(fbLock) { framebuffer = fresh; lastDamage = emptyList() }
-                            scratch = IntArray(fbW * fbH)
-                            _fbSize.value = ns
-                            cursor.value = android.graphics.Point(fbW / 2, fbH / 2)
-                            // Route through the serialized writer so this full-update
-                            // request can't byte-interleave with a concurrent input
-                            // write. Capture the just-resized dimensions explicitly.
-                            val rw = fbW; val rh = fbH
-                            submitRfb { VncClient.requestFramebufferUpdate(it, w = rw, h = rh, incremental = false) }
-                            return@let
-                        }
+                    val ns = upd.newSize
+                    if (ns != null && (ns.w != fbW || ns.h != fbH)) {
+                        fbW = ns.w; fbH = ns.h
+                        val fresh = IntArray(fbW * fbH)
+                        // Clear damage in the same critical section that swaps the
+                        // framebuffer so a recomposition between resize and the next
+                        // full frame can't blit stale damage rects against the new size.
+                        synchronized(fbLock) { framebuffer = fresh; lastDamage = emptyList() }
+                        scratch = IntArray(fbW * fbH)
+                        _fbSize.value = ns
+                        cursor.value = android.graphics.Point(fbW / 2, fbH / 2)
+                        // Route through the serialized writer so this full-update
+                        // request can't byte-interleave with a concurrent input
+                        // write. Capture the just-resized dimensions explicitly.
+                        val rw = fbW; val rh = fbH
+                        submitRfb { VncClient.requestFramebufferUpdate(it, w = rw, h = rh, incremental = false) }
+                        // Skip the rest of this iteration: the old code used
+                        // return@let here, which only exited the let lambda and
+                        // then fell through to overwrite lastDamage with rects
+                        // measured against the OLD geometry (the exact race the
+                        // synchronized block above prevents) and fire a spurious
+                        // incremental request.
+                        continue
                     }
                     synchronized(fbLock) {
                         System.arraycopy(scratch, 0, framebuffer, 0, framebuffer.size)
@@ -156,7 +161,13 @@ class X11ViewModel @Inject constructor(
                     submitRfb { VncClient.requestFramebufferUpdate(it, w = fbW, h = fbH, incremental = true) }
                 }
             } catch (e: Exception) {
-                _connection.value = X11ConnectionState.Failed(e.message ?: "unknown")
+                // A user-initiated disconnect() cancels this job and closes the
+                // socket, which surfaces here as a SocketException; that is not a
+                // failure, so only report Failed when the job is still active (a
+                // genuine read/connect error). Cancellation flips isActive false
+                // before the close lands, so the finally falls through to
+                // Disconnected instead.
+                if (isActive) _connection.value = X11ConnectionState.Failed(e.message ?: "unknown")
             } finally {
                 rfbOut = null
                 rfbSocket = null
@@ -185,6 +196,17 @@ class X11ViewModel @Inject constructor(
         heldButtons = 0
         sessionJob?.cancel()
         sessionJob = null
+        // Coroutine cancellation can't interrupt the blocking native socket read
+        // in connect()'s read loop, so on an idle desktop (no framebuffer updates
+        // arriving to unblock readFully) the read parks forever and the finally
+        // that closes the socket, stops audio, and resets state never runs —
+        // leaking the socket, its IO thread, and the audio stream on every screen
+        // exit. Force-close the socket so the read throws and the finally runs.
+        // Queued on the serialized writer AFTER the button-up above so that release
+        // still flushes first; this is the same path connect()'s finally uses.
+        // onDispose() calls disconnect() while the ViewModel scope is still alive
+        // (onCleared runs later), so this executes.
+        rfbSocket?.let { sock -> viewModelScope.launch(rfbDispatcher) { runCatching { sock.close() } } }
     }
 
     @Volatile private var lastViewportW = 0

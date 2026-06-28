@@ -101,6 +101,7 @@
     <string name="both">Both</string>
     <string name="enter_valid_ports">Enter valid port numbers (1–65535)</string>
     <string name="port_already_forwarded">Port %1$d (%2$s) is already forwarded</string>
+    <string name="port_reserved">Port %1$d is reserved for the in-app desktop</string>
     <string name="reset">Reset</string>
     <string name="remove">Remove</string>
     <string name="port_forwards_count">Port forwards (%1$d)</string>
@@ -123,6 +124,7 @@
     <!-- Dialogs -->
     <string name="update_available">Update available</string>
     <string name="version_available">Version %1$s is available. You have %2$s.</string>
+    <string name="update_open_failed">Couldn\'t open the download page. No browser available?</string>
 
     <!-- Language -->
     <string name="language_label">Language</string>
@@ -144,6 +146,7 @@
     <string name="terminal_title">Terminal</string>
     <string name="vm_not_running_hint">Start the VM from the Home screen first.</string>
     <string name="back_to_home">Back to Home</string>
+    <string name="terminal_disconnected_tap_retry">Disconnected. Tap to reconnect.</string>
 
     <!-- Terminal Quick Settings -->
     <string name="display_section">Display</string>
@@ -170,6 +173,7 @@
 
     <!-- X11 -->
     <string name="x11_title">X11</string>
+    <string name="x11_open">Open X11 desktop</string>
     <string name="x11_connecting">Connecting to X11 server...</string>
     <string name="x11_not_ready">X11 server not ready — VM still booting?</string>
     <string name="fullscreen">Fullscreen</string>

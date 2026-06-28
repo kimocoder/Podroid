@@ -18,12 +18,14 @@ import com.excp.podroid.data.repository.LanguageManager
 import com.excp.podroid.data.repository.PortForwardRepository
 import com.excp.podroid.data.repository.PortForwardRule
 import com.excp.podroid.data.repository.SettingsRepository
+import com.excp.podroid.di.ApplicationScope
 import com.excp.podroid.engine.EngineSelection
 import com.excp.podroid.engine.VmEngine
 import com.excp.podroid.engine.VmState
 import com.excp.podroid.util.NetworkUtils
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -68,6 +70,7 @@ class SettingsViewModel @Inject constructor(
     private val portForwardRepository: PortForwardRepository,
     private val engine: VmEngine,
     private val languageManager: LanguageManager,
+    @ApplicationScope private val externalScope: CoroutineScope,
 ) : ViewModel() {
 
     val vmRamMb: StateFlow<Int> = settingsRepository.vmRamMb
@@ -127,20 +130,26 @@ class SettingsViewModel @Inject constructor(
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), SettingsUiState())
 
+    // The Advanced VM-args fields (AdvancedTextSetting) buffer edits locally and
+    // commit them on focus loss or composable disposal. Disposal coincides with
+    // this ViewModel being cleared on back-navigation, which cancels viewModelScope
+    // before a viewModelScope.launch could finish the DataStore write — silently
+    // dropping the edit (issue #46). Persist on the application-lifetime scope so
+    // the write outlives the screen teardown.
     fun setQemuExtraArgs(value: String) {
-        viewModelScope.launch { settingsRepository.setQemuExtraArgs(value) }
+        externalScope.launch { settingsRepository.setQemuExtraArgs(value) }
     }
 
     fun setKernelExtraCmdline(value: String) {
-        viewModelScope.launch { settingsRepository.setKernelExtraCmdline(value) }
+        externalScope.launch { settingsRepository.setKernelExtraCmdline(value) }
     }
 
     fun resetQemuExtraArgs() {
-        viewModelScope.launch { settingsRepository.setQemuExtraArgs(SettingsRepository.DEFAULT_QEMU_EXTRA_ARGS) }
+        externalScope.launch { settingsRepository.setQemuExtraArgs(SettingsRepository.DEFAULT_QEMU_EXTRA_ARGS) }
     }
 
     fun resetKernelExtraCmdline() {
-        viewModelScope.launch { settingsRepository.setKernelExtraCmdline(SettingsRepository.DEFAULT_KERNEL_EXTRA_CMDLINE) }
+        externalScope.launch { settingsRepository.setKernelExtraCmdline(SettingsRepository.DEFAULT_KERNEL_EXTRA_CMDLINE) }
     }
 
     val storageSizeGb: StateFlow<Int> = settingsRepository.storageSizeGb
@@ -217,6 +226,10 @@ class SettingsViewModel @Inject constructor(
     // The caller uses the return value to show feedback instead of silently
     // closing the dialog on a duplicate.
     fun addPortForward(hostPort: Int, guestPort: Int, protocol: String = "tcp"): Boolean {
+        // Backstop the dialog's reserved-port check: these host ports back the
+        // implicit loopback-bound X11 forwards and must never be user-bound to
+        // 0.0.0.0 (the dialog rejects them with a dedicated message first).
+        if (hostPort in PortForwardRepository.RESERVED_HOST_PORTS) return false
         val protos = if (protocol == "both") listOf("tcp", "udp") else listOf(protocol)
         val existing = portForwardRules.value.toSet()
         val toAdd = protos.filter { proto ->

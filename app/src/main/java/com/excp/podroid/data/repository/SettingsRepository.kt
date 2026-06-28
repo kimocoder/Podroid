@@ -8,14 +8,17 @@ package com.excp.podroid.data.repository
 
 import android.content.Context
 import androidx.datastore.core.DataStore
+import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.excp.podroid.engine.EngineSelection
+import com.excp.podroid.engine.avf.AvfCpuPolicy
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
@@ -25,7 +28,15 @@ import java.io.IOException
 import javax.inject.Inject
 import javax.inject.Singleton
 
-internal val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
+// corruptionHandler: a CorruptionException (subclass of IOException) on read
+// otherwise makes every edit{} throw forever with no self-heal. Resetting to
+// empty preferences (defaults re-apply on next read) beats a permanently broken
+// settings store. This only fires on genuine on-disk corruption, not on normal
+// missing keys.
+internal val Context.dataStore: DataStore<Preferences> by preferencesDataStore(
+    name = "settings",
+    corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
+)
 
 @Singleton
 class SettingsRepository @Inject constructor(
@@ -52,6 +63,13 @@ class SettingsRepository @Inject constructor(
         val KEY_ENGINE_SELECTION       = stringPreferencesKey("engine_selection")
         val KEY_AVF_HINT_DISMISSED      = booleanPreferencesKey("avf_hint_dismissed")
         val KEY_AVF_VERBOSE_LOGGING     = booleanPreferencesKey("avf_verbose_logging")
+        // Per-device AVF vCPU cap discovered at runtime: on Tensor G3/G4 the
+        // MATCH_HOST topology resets the guest in early boot above a certain core
+        // count (issue #29). AvfEngine steps this down on an early-boot reset and
+        // persists it so later launches go straight to the count that boots.
+        // 0 (AvfCpuPolicy.NO_CAP) = none discovered yet; cleared when the user
+        // changes the CPU-count setting so the new value is re-probed.
+        val KEY_AVF_CPU_CAP             = intPreferencesKey("avf_cpu_cap")
         val KEY_USB_PASSTHROUGH_ENABLED = booleanPreferencesKey("usb_passthrough_enabled")
 
         val KEY_X11_RES_MODE        = stringPreferencesKey("x11_resolution_mode")
@@ -98,7 +116,7 @@ class SettingsRepository @Inject constructor(
 
     private fun <T> pref(key: Preferences.Key<T>, default: T): Flow<T> =
         context.dataStore.data
-            .catch { e -> if (e is IOException) emit(androidx.datastore.preferences.core.emptyPreferences()) else throw e }
+            .catch { e -> if (e is IOException) emit(emptyPreferences()) else throw e }
             .map { it[key] ?: default }
 
     private suspend fun <T> set(key: Preferences.Key<T>, value: T) =
@@ -125,10 +143,11 @@ class SettingsRepository @Inject constructor(
     val hapticsEnabled       = pref(KEY_HAPTICS_ENABLED, true)
     val dynamicColorEnabled  = pref(KEY_DYNAMIC_COLOR_ENABLED, false)
     val lastBootDurationMs   = pref(KEY_LAST_BOOT_DURATION_MS, 0L)
-    val language: Flow<String> = context.dataStore.data.map { prefs ->
-        prefs[KEY_LANGUAGE] ?: "auto"
-    }
+    // Routed through pref() so a corrupted store emits the "auto" default instead
+    // of throwing into LanguageManager's locale collector.
+    val language: Flow<String> = pref(KEY_LANGUAGE, "auto")
     val avfHintDismissed     = pref(KEY_AVF_HINT_DISMISSED, false)
+    val avfCpuCap            = pref(KEY_AVF_CPU_CAP, 0)
     val usbPassthroughEnabled = pref(KEY_USB_PASSTHROUGH_ENABLED, false)
     val avfVerboseLogging: Flow<Boolean> = context.dataStore.data
         .catch { e -> if (e is IOException) emit(androidx.datastore.preferences.core.emptyPreferences()) else throw e }
@@ -142,7 +161,17 @@ class SettingsRepository @Inject constructor(
 
     suspend fun setDarkTheme(value: Boolean)             = set(KEY_DARK_THEME, value)
     suspend fun setVmRamMb(value: Int)                   = set(KEY_VM_RAM, value)
-    suspend fun setVmCpus(value: Int)                    = set(KEY_VM_CPUS, value)
+    suspend fun setVmCpus(value: Int) {
+        // One transaction so a collector never observes the new CPU count paired
+        // with the stale cap, and a process death between the two writes can't
+        // persist that inconsistent pair (which would defeat the re-probe). A
+        // manual CPU-count change re-probes from scratch: drop any AVF cap
+        // discovered for the previous value (see KEY_AVF_CPU_CAP).
+        context.dataStore.edit {
+            it[KEY_VM_CPUS] = value
+            it[KEY_AVF_CPU_CAP] = AvfCpuPolicy.NO_CAP
+        }
+    }
     suspend fun setTerminalFontSize(value: Int)          = set(KEY_FONT_SIZE, value)
     suspend fun setStorageSizeGb(value: Int)             = set(KEY_STORAGE_GB, value)
     suspend fun setStorageAccessEnabled(value: Boolean)  = set(KEY_STORAGE_ACCESS_ENABLED, value)
@@ -160,7 +189,29 @@ class SettingsRepository @Inject constructor(
     suspend fun setEngineSelection(value: EngineSelection) = set(KEY_ENGINE_SELECTION, value.name)
     suspend fun setAvfHintDismissed(value: Boolean)      = set(KEY_AVF_HINT_DISMISSED, value)
     suspend fun setAvfVerboseLogging(value: Boolean)     = set(KEY_AVF_VERBOSE_LOGGING, value)
+    suspend fun setAvfCpuCap(value: Int)                 = set(KEY_AVF_CPU_CAP, value)
     suspend fun setUsbPassthroughEnabled(value: Boolean) = set(KEY_USB_PASSTHROUGH_ENABLED, value)
+
+    /**
+     * Persists all first-run setup choices in a single transaction so a process
+     * kill mid-write can't leave a half-completed setup. Centralizes the write of
+     * KEY_STORAGE_GB (the only key whose value can trigger storage resize) so it
+     * has one choke point for validation; storage is clamped to >= 1 GB.
+     */
+    suspend fun completeSetup(
+        storageSizeGb: Int,
+        sshEnabled: Boolean,
+        storageAccessEnabled: Boolean,
+        usbPassthroughEnabled: Boolean,
+    ) {
+        context.dataStore.edit {
+            it[KEY_STORAGE_GB] = storageSizeGb.coerceAtLeast(1)
+            it[KEY_SSH_ENABLED] = sshEnabled
+            it[KEY_STORAGE_ACCESS_ENABLED] = storageAccessEnabled
+            it[KEY_USB_PASSTHROUGH_ENABLED] = usbPassthroughEnabled
+            it[KEY_SETUP_DONE] = true
+        }
+    }
 
     val x11Settings: kotlinx.coroutines.flow.Flow<com.excp.podroid.x11.X11Settings> = context.dataStore.data
         .catch { e -> if (e is IOException) emit(androidx.datastore.preferences.core.emptyPreferences()) else throw e }
@@ -208,5 +259,6 @@ class SettingsRepository @Inject constructor(
     suspend fun getKernelExtraCmdlineSnapshot()   = kernelExtraCmdline.first()
     suspend fun getEngineSelectionSnapshot()      = engineSelection.first()
     suspend fun getAvfVerboseLoggingSnapshot()    = avfVerboseLogging.first()
+    suspend fun getAvfCpuCapSnapshot()            = avfCpuCap.first()
     suspend fun getUsbPassthroughEnabledSnapshot() = usbPassthroughEnabled.first()
 }

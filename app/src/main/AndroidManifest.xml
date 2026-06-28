@@ -38,6 +38,7 @@
     <!-- Storage access for persistent container storage -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
 
     <!-- Large heap for QEMU memory allocation -->
     <uses-feature android:name="android.hardware.opengles.aep" android:required="false" />

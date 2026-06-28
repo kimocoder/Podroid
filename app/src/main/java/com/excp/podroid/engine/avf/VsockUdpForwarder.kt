@@ -41,6 +41,8 @@ class VsockUdpForwarder(
     private val guestVsockPort: Int,
     private val vm: Any,
     private val scope: CoroutineScope,
+    // 127.0.0.1 for loopback-only rules; 0.0.0.0 for user rules (see VsockPortForwarder).
+    private val bindAddress: String = "0.0.0.0",
 ) : Forwarder {
     companion object {
         private const val TAG = "VsockUdpForwarder"
@@ -73,13 +75,13 @@ class VsockUdpForwarder(
         val s = DatagramSocket(null)
         s.reuseAddress = true
         try {
-            s.bind(InetSocketAddress(InetAddress.getByName("0.0.0.0"), hostPort))
+            s.bind(InetSocketAddress(InetAddress.getByName(bindAddress), hostPort))
         } catch (e: Throwable) {
             runCatching { s.close() }
             throw e
         }
         socket = s
-        Log.d(TAG, "listening udp 0.0.0.0:$hostPort → vsock:$guestVsockPort")
+        Log.d(TAG, "listening udp $bindAddress:$hostPort → vsock:$guestVsockPort")
         recvJob = scope.launch(Dispatchers.IO + children) { receiveLoop(s) }
         reaperJob = scope.launch(Dispatchers.IO + children) { reapLoop() }
     }

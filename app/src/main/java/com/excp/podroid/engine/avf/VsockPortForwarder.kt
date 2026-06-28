@@ -40,6 +40,9 @@ class VsockPortForwarder(
     private val guestVsockPort: Int,
     private val vm: Any,
     private val scope: CoroutineScope,
+    // 127.0.0.1 for the implicit VNC/audio forwards (off the network);
+    // 0.0.0.0 for user rules so a PC on the LAN can reach them.
+    private val bindAddress: String = "0.0.0.0",
 ) : Forwarder {
     companion object {
         private const val TAG = "VsockPortForwarder"
@@ -73,9 +76,9 @@ class VsockPortForwarder(
     @Volatile private var closed = false
 
     override fun start() {
-        val s = ServerSocket(hostPort, /* backlog */ 16, InetAddress.getByName("0.0.0.0"))
+        val s = ServerSocket(hostPort, /* backlog */ 16, InetAddress.getByName(bindAddress))
         server = s
-        Log.d(TAG, "listening on 0.0.0.0:$hostPort → vsock:$guestVsockPort")
+        Log.d(TAG, "listening on $bindAddress:$hostPort → vsock:$guestVsockPort")
         acceptJob = scope.launch(Dispatchers.IO) {
             while (!closed) {
                 val client = try { s.accept() } catch (_: SocketException) { break }

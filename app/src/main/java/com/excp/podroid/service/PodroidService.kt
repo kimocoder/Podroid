@@ -110,15 +110,26 @@ class PodroidService : Service() {
                 }
             }
             ACTION_STOP -> {
-                // engine.stop() is a no-op if nothing is running. Either way the
-                // shutdown observer only fires after an active state, so on the
-                // "stop while idle" path (e.g. PodroidService.stop() spinning up a
-                // fresh service) we must release + stop here so this doesn't
-                // linger as a started-but-never-foregrounded orphan.
+                val wasActive = engine.state.value is VmState.Starting ||
+                    engine.state.value is VmState.Running
                 engine.stop()
-                releaseWakeLock()
-                stopForegroundCompat()
-                stopSelf()
+                if (wasActive) {
+                    // engine.stop() kicks off an async best-effort guest flush
+                    // (AVF syncAndWait, up to 8s) on the engine's own scope and
+                    // returns immediately. Releasing the partial WakeLock here
+                    // would let the CPU suspend mid-flush with the screen off,
+                    // defeating the deliberate ext4 sync. Keep it held; the
+                    // shutdown observer runs teardown() (release + stopSelf) once
+                    // the engine reaches Stopped/Error.
+                    Log.d(TAG, "ACTION_STOP: VM active — deferring teardown to state observer")
+                } else {
+                    // Stop while idle (e.g. a fresh service spun up only to stop):
+                    // no terminal transition will arrive, so release + stop now so
+                    // this doesn't linger as a started-but-never-foregrounded orphan.
+                    releaseWakeLock()
+                    stopForegroundCompat()
+                    stopSelf()
+                }
             }
             else -> {
                 // Null/unrecognized action (e.g. a system redelivery): we never
@@ -322,11 +333,14 @@ class PodroidService : Service() {
 
                     // Always-on X11 viewer forwards. These are implicit, not user-managed —
                     // they back the in-app screen toggle and never appear in the PortForward UI.
+                    // loopbackOnly = bind 127.0.0.1: the in-app viewer dials loopback, and
+                    // Xvnc runs with no auth + PulseAudio streams raw PCM, so binding 0.0.0.0
+                    // would hand any device on the same Wi-Fi a no-password root X session.
                     if (rules.none { it.hostPort == X11Constants.VNC_PORT }) {
-                        rules.add(com.excp.podroid.data.repository.PortForwardRule(X11Constants.VNC_PORT, X11Constants.VNC_PORT, "tcp"))
+                        rules.add(com.excp.podroid.data.repository.PortForwardRule(X11Constants.VNC_PORT, X11Constants.VNC_PORT, "tcp", loopbackOnly = true))
                     }
                     if (rules.none { it.hostPort == X11Constants.AUDIO_PORT }) {
-                        rules.add(com.excp.podroid.data.repository.PortForwardRule(X11Constants.AUDIO_PORT, X11Constants.AUDIO_PORT, "tcp"))
+                        rules.add(com.excp.podroid.data.repository.PortForwardRule(X11Constants.AUDIO_PORT, X11Constants.AUDIO_PORT, "tcp", loopbackOnly = true))
                     }
 
                     val config = VmConfig(

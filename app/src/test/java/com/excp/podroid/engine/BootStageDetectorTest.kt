@@ -84,17 +84,17 @@ class BootStageDetectorTest {
     }
 
     @Test
-    fun `reset re-arms the one-shot so a second boot fires Running again`() {
-        val (detector, stage, state) = newDetector()
-        detector.feed("Ready!\n")
-        assertTrue(state.value is VmState.Running)
+    fun `a fresh detector instance re-detects a new boot (per-run allocation)`() {
+        // QEMU and AVF both allocate a new detector per run rather than resetting
+        // one in place; a brand-new instance must detect a boot stream from clean.
+        val (first, _, firstState) = newDetector()
+        first.feed("Ready!\n")
+        assertTrue(firstState.value is VmState.Running)
 
-        detector.reset()
-        state.value = VmState.Starting
-        // A fresh boot stream after reset must be detected again.
-        detector.feed("Booting kernel...\n")
-        assertEquals("Booting kernel...", stage.value)
-        detector.feed("Ready!\n")
-        assertTrue(state.value is VmState.Running)
+        val (second, secondStage, secondState) = newDetector()
+        second.feed("Booting kernel...\n")
+        assertEquals("Booting kernel...", secondStage.value)
+        second.feed("Ready!\n")
+        assertTrue(secondState.value is VmState.Running)
     }
 }

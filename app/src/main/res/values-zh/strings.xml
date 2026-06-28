@@ -101,6 +101,7 @@
     <string name="both">两者</string>
     <string name="enter_valid_ports">输入有效的端口号 (1-65535)</string>
     <string name="port_already_forwarded">端口 %1$d (%2$s) 已转发</string>
+    <string name="port_reserved">端口 %1$d 已保留给应用内桌面</string>
     <string name="reset">重置</string>
     <string name="remove">删除</string>
     <string name="port_forwards_count">端口转发 (%1$d)</string>
@@ -123,6 +124,7 @@
     <!-- Dialogs -->
     <string name="update_available">有新版本可用</string>
     <string name="version_available">版本 %1$s 可用。当前版本 %2$s。</string>
+    <string name="update_open_failed">无法打开下载页面。没有可用的浏览器？</string>
 
     <!-- Language -->
     <string name="language_label">语言</string>
@@ -144,6 +146,7 @@
     <string name="terminal_title">终端</string>
     <string name="vm_not_running_hint">请先从主屏幕启动虚拟机。</string>
     <string name="back_to_home">返回主屏幕</string>
+    <string name="terminal_disconnected_tap_retry">已断开连接。点按以重新连接。</string>
 
     <!-- Terminal Quick Settings -->
     <string name="display_section">显示</string>
@@ -170,6 +173,7 @@
 
     <!-- X11 -->
     <string name="x11_title">X11</string>
+    <string name="x11_open">打开 X11 桌面</string>
     <string name="x11_connecting">正在连接 X11 服务器...</string>
     <string name="x11_not_ready">X11 服务器未就绪 — 虚拟机是否仍在启动？</string>
     <string name="fullscreen">全屏</string>

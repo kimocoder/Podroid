@@ -1,0 +1,69 @@
+# Normalize line endings for files that run in Linux contexts.
+# All shell scripts, init files, and Linux config files MUST have LF endings;
+# Windows CRLF line endings break shebang parsing and OpenRC service scripts.
+
+# Default: let git auto-detect text vs binary
+* text=auto
+
+# Force LF for all shell scripts and Linux-targeted text files
+*.sh            text eol=lf
+*.c             text eol=lf
+*.h             text eol=lf
+Dockerfile*     text eol=lf
+Makefile*       text eol=lf
+*.mk            text eol=lf
+*.conf          text eol=lf
+*.md            text eol=lf
+*.txt           text eol=lf
+*.gradle        text eol=lf
+*.kts           text eol=lf
+*.kt            text eol=lf
+*.java          text eol=lf
+*.xml           text eol=lf
+*.json          text eol=lf
+*.yaml          text eol=lf
+*.yml           text eol=lf
+*.toml          text eol=lf
+*.properties    text eol=lf
+*.config        text eol=lf
+
+# Explicitly force LF for files without extensions that are Linux scripts
+init-podroid                                    text eol=lf
+build-rootfs/files/etc/init.d/podroid-bootstrap text eol=lf
+build-rootfs/files/etc/init.d/podroid-network   text eol=lf
+build-rootfs/files/etc/init.d/podroid-ready     text eol=lf
+build-rootfs/files/etc/init.d/podroid-resize    text eol=lf
+build-rootfs/files/etc/init.d/podroid-x11       text eol=lf
+build-rootfs/files/etc/init.d/podroid-vsock     text eol=lf
+build-rootfs/files/etc/init.d/podroid-hostd     text eol=lf
+build-rootfs/files/etc/init.d/podroid-migrate   text eol=lf
+build-rootfs/files/etc/inittab                  text eol=lf
+build-rootfs/files/etc/rc.conf                  text eol=lf
+build-rootfs/files/etc/conf.d/podroid           text eol=lf
+build-rootfs/files/usr/local/bin/podroid-getty  text eol=lf
+build-rootfs/files/usr/local/bin/podroid-login  text eol=lf
+build-rootfs/files/usr/local/bin/podroid-resize text eol=lf
+build-rootfs/files/etc/podroid/forwards.conf    text eol=lf
+
+# Binary assets — never convert
+*.squashfs      binary
+*.img           binary
+*.so            binary
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.webp          binary
+*.ico           binary
+*.ttf           binary
+*.otf           binary
+*.woff          binary
+*.woff2         binary
+*.apk           binary
+*.jks           binary
+*.keystore      binary
+*.zip           binary
+*.gz            binary
+*.bz2           binary
+*.xz            binary
+*.zst           binary

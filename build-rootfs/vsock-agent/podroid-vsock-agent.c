@@ -332,13 +332,21 @@ static int tcp_connect(const char *host, int port) {
     return s;
 }
 
-/* Forks the parent off — this function never returns in the child. */
-static void tcp_listener_main(int vport, const char *host, int gport) {
+/* Forks the parent off — this function never returns in the child. sync_fd is
+ * the write end of a pipe the parent reads to learn whether bind/listen
+ * succeeded before it advertises this forward. */
+static void tcp_listener_main(int vport, const char *host, int gport, int sync_fd) {
     /* New process group rooted at this listener's PID. Splice children forked
      * below inherit it, so REMOVE can kill(-pgid) the listener AND every
      * in-flight connection in one shot. setpgid(0,0) makes pgid == our pid. */
     setpgid(0, 0);
     int s = vsock_listen(vport);
+    /* Report the bind/listen result to the parent before it records the
+     * {vport,pid} row: a failure (e.g. EADDRINUSE in a fast remove-then-add)
+     * must not advertise a listener that isn't actually accepting. */
+    char ok = (s < 0) ? 0 : 1;
+    if (write(sync_fd, &ok, 1) != 1) { /* parent gone; nothing to do */ }
+    close(sync_fd);
     if (s < 0) _exit(1);
     /* Drop fds inherited from the parent that this listener has no use for: the
      * ctl listening socket, and (when forked from a live handle_add) the ctl
@@ -461,10 +469,14 @@ static void udp_relay(int vsock_fd, const char *host, int gport) {
     close(vsock_fd);
 }
 
-/* Forks the parent off — this function never returns in the child. */
-static void udp_listener_main(int vport, const char *host, int gport) {
+/* Forks the parent off — this function never returns in the child. sync_fd
+ * carries the bind/listen result back to the parent (see tcp_listener_main). */
+static void udp_listener_main(int vport, const char *host, int gport, int sync_fd) {
     setpgid(0, 0);
     int s = vsock_listen(vport);
+    char ok = (s < 0) ? 0 : 1;
+    if (write(sync_fd, &ok, 1) != 1) { /* parent gone; nothing to do */ }
+    close(sync_fd);
     if (s < 0) _exit(1);
     close_inherited_fds(s);
     LOG_I("udp listener: vsock:%d → %s:%d", vport, host, gport);
@@ -491,11 +503,31 @@ static int spawn_listener(int vport, const char *host, int gport, int is_udp) {
         if (pid_alive(listeners[idx].pid)) return 0;  // already running
         listener_remove(idx);  // stale row for a dead listener — drop and respawn
     }
+    /* Sync pipe: the child reports its bind/listen result so we record the
+     * {vport,pid} row only once the listener is actually accepting. */
+    int sync_pipe[2];
+    if (pipe(sync_pipe) < 0) {
+        LOG_E("spawn vsock:%d pipe() failed: %s", vport, strerror(errno));
+        return -1;
+    }
     pid_t pid = fork();
-    if (pid < 0) return -1;
+    if (pid < 0) { close(sync_pipe[0]); close(sync_pipe[1]); return -1; }
     if (pid == 0) {
-        if (is_udp) udp_listener_main(vport, host, gport);  // never returns
-        else        tcp_listener_main(vport, host, gport);  // never returns
+        close(sync_pipe[0]);  // child keeps only the write end
+        if (is_udp) udp_listener_main(vport, host, gport, sync_pipe[1]);  // never returns
+        else        tcp_listener_main(vport, host, gport, sync_pipe[1]);  // never returns
+        _exit(127);  // defensive: the *_listener_main calls never return
+    }
+    close(sync_pipe[1]);  // parent keeps the read end; the child is the sole writer
+    char ok = 0;
+    ssize_t n = read(sync_pipe[0], &ok, 1);
+    close(sync_pipe[0]);
+    if (n != 1 || ok != 1) {
+        /* Bind/listen failed: the child has already exited (or is exiting). Don't
+         * advertise it and don't signal pid — it may be reaped and its pid
+         * recycled (see handle_remove); the SIGCHLD handler reaps the child. */
+        LOG_W("spawn vsock:%d: listener did not come up", vport);
+        return -1;
     }
     setpgid(pid, pid);
     if (listener_add(vport, pid) < 0) {

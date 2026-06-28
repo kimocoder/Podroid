@@ -35,6 +35,16 @@ internal fun shouldCheck(now: Long, lastCheck: Long, validityMs: Long): Boolean 
 }
 
 /**
+ * Timestamp to persist after a failed update check so [shouldCheck] re-opens the
+ * gate at the right time. A definitive outcome (GitHub was actually reached)
+ * backs off the full [validityMs]. A transient failure (offline / DNS / timeout)
+ * is back-dated so the existing validity gate re-opens after only [retryFloorMs]
+ * instead of a full day — one offline launch must not suppress the check for 24h.
+ */
+internal fun backoffStamp(now: Long, transient: Boolean, validityMs: Long, retryFloorMs: Long): Long =
+    if (transient) now - validityMs + retryFloorMs else now
+
+/**
  * Returns true if `latest` is a higher version than `current`. Compares the
  * numeric core (`1.2.3`) first; if those are equal, treats a prerelease suffix
  * (`-rc2`) as lower than a release, and compares prerelease numeric chunks
@@ -114,6 +124,10 @@ class UpdateRepository @Inject constructor(
     private val dismissedKey = stringPreferencesKey("dismissed_update_version")
     private val lastCheckKey = longPreferencesKey("update_check_timestamp")
     private val cacheValidityMs = 24 * 60 * 60 * 1000L
+    // A transient (IOException) failure backs off only this long instead of the
+    // full cacheValidityMs, so a single offline launch doesn't suppress the next
+    // in-app update check for a full day.
+    private val retryFloorMs = 20 * 60 * 1000L
 
     suspend fun checkForUpdate(currentVersion: String): UpdateInfo? = withContext(Dispatchers.IO) {
         // Wall-clock time so the 24h gate survives device reboots and deep sleep.
@@ -159,9 +173,21 @@ class UpdateRepository @Inject constructor(
             // 1.1.7-debug compares equal to the 1.1.7 release tag instead of "older".
             val normalizedCurrent = currentVersion.removeSuffix("-debug")
             if (isNewer(tag, normalizedCurrent)) UpdateInfo(tag, url) else null
-        } catch (_: Exception) {
-            // Network/DataStore error: still record the timestamp to back off on the next launch.
-            runCatching { context.dataStore.edit { it[lastCheckKey] = now } }
+        } catch (c: kotlinx.coroutines.CancellationException) {
+            // Coroutine cancellation is not a check failure — don't record a
+            // timestamp (which would back off a check the user may retry) and
+            // don't swallow it; let it propagate.
+            throw c
+        } catch (e: Exception) {
+            // Network/DataStore/JSON error: log it (a changed GitHub response or
+            // JSON shape was previously failing invisibly) and record a timestamp
+            // to back off on the next launch. A transient network failure
+            // (offline / DNS / timeout — all IOException) only earns the short
+            // retry floor; a non-IO error means GitHub was reached but returned
+            // something unusable, so it keeps the full 24h backoff.
+            android.util.Log.w("UpdateRepository", "update check failed", e)
+            val stamp = backoffStamp(now, transient = e is java.io.IOException, cacheValidityMs, retryFloorMs)
+            runCatching { context.dataStore.edit { it[lastCheckKey] = stamp } }
             null
         } finally {
             connection?.disconnect()
@@ -169,7 +195,11 @@ class UpdateRepository @Inject constructor(
     }
 
     suspend fun isDismissed(version: String): Boolean {
-        val dismissed = context.dataStore.data.first()[dismissedKey]
+        // Shield the read so a corrupted store returns "not dismissed" instead of
+        // throwing into the caller.
+        val dismissed = context.dataStore.data
+            .catch { e -> if (e is java.io.IOException) emit(emptyPreferences()) else throw e }
+            .first()[dismissedKey]
         return dismissed == version
     }
 

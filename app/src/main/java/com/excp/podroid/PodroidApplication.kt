@@ -50,8 +50,11 @@ class PodroidApplication : Application() {
     suspend fun awaitAssetsReady() = assetsReady.await()
 
     // Android 14+ hides @SystemApi reflection lookups (returning NoSuchMethod
-    // even via getDeclared*). Two prefixes need exempting:
+    // even via getDeclared*). Prefixes needing exemption:
     //   - Landroid/system/virtualmachine/ — AVF framework (AvfDiagnostics + AvfEngine)
+    //   - Landroid/system/virtualizationservice/ — AVF AIDL parcelables
+    //     (CpuOptions, VirtualMachineRawConfig, IVirtualizationService) used by
+    //     AvfReflect's explicit-vCPU-count hook (issue #29).
     //   - Ljava/net/UnixDomainSocketAddress — ConsoleFanout needs UDS.of(String)
     //     which Android marks BLOCKED for untrusted_app even though the class
     //     itself is on the bootclasspath.
@@ -61,6 +64,7 @@ class PodroidApplication : Application() {
         runCatching {
             HiddenApiBypass.addHiddenApiExemptions(
                 "Landroid/system/virtualmachine/",
+                "Landroid/system/virtualizationservice/",
                 "Landroid/system/UnixSocketAddress",
                 "Ljava/net/UnixDomainSocketAddress",
             )
@@ -102,6 +106,7 @@ class PodroidApplication : Application() {
                 { copyAssetIfNeeded("alpine-rootfs.squashfs", filesDir, forceCopy) },
             )
             val pool = Executors.newFixedThreadPool(tasks.size.coerceAtMost(4))
+            var allSucceeded = true
             try {
                 // invokeAll blocks until every Callable finishes (or times out).
                 // Each Callable wraps the task so a thrown exception is captured
@@ -114,19 +119,29 @@ class PodroidApplication : Application() {
                         // copyAssetIfNeeded / copyAssetFileIfNeeded already log
                         // their own failures; this catches anything that escaped.
                         Log.w(TAG, "Asset extraction task failed", e)
+                        allSucceeded = false
                     }
                 }
             } finally {
                 pool.shutdown()
                 if (!pool.awaitTermination(30, TimeUnit.SECONDS)) {
                     pool.shutdownNow()
+                    allSucceeded = false
                 }
             }
 
-            // Commit the new stamp only after extraction so a half-finished copy
-            // (process killed mid-extract) doesn't leave us thinking we're done.
-            runCatching { stampFile.writeText(currentStamp) }
-                .onFailure { Log.w(TAG, "Failed to write assets stamp", it) }
+            // Commit the new stamp ONLY if every extraction task succeeded.
+            // Writing it after a failed copy (e.g. squashfs copy failed on an
+            // upgrade: disk full, killed mid-copy) would mark the OLD file as
+            // current — and because mksquashfs is deterministic the size check
+            // can't catch it either, so a stale rootfs would boot forever. On
+            // failure we leave the stamp stale so the next launch re-extracts.
+            if (allSucceeded) {
+                runCatching { stampFile.writeText(currentStamp) }
+                    .onFailure { Log.w(TAG, "Failed to write assets stamp", it) }
+            } else {
+                Log.w(TAG, "asset extraction incomplete — leaving stamp stale to force re-extract next launch")
+            }
         } finally {
             // Always release waiters — a failed/partial extract is detected by
             // the per-file size-check on the next read, not by hanging here.

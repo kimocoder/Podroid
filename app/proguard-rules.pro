@@ -6,8 +6,11 @@
     public com.termux.terminal.TerminalEmulator mEmulator;
 }
 
-# TerminalSession.mEmulator replaced via reflection in TerminalViewModel
-# to install a no-op TerminalOutput (prevents CPR garbage in the VM shell).
+# TerminalSession.mEmulator: read via the public getEmulator() to wire the
+# emulator into TerminalView. The app no longer reflects on this field (the old
+# DECSET-flag reflection was replaced by the public isCursorKeysApplicationMode
+# / isFocusEventsEnabled accessors), so this keep rule is belt-and-suspenders
+# against R8 stripping the field behind the getter.
 -keepclassmembers class com.termux.terminal.TerminalSession {
     com.termux.terminal.TerminalEmulator mEmulator;
 }

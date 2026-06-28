@@ -120,7 +120,14 @@ class QemuEngine @Inject constructor(
     /** Per-run serial monitor; created in start(), released in cleanup(). */
     private var bootMonitor: QemuBootMonitor? = null
 
-    private val bootStageDetector = BootStageDetector(_bootStage, _state) {
+    /**
+     * Fresh detector per run (see start()) rather than one reused instance.
+     * The previous run's boot monitor may still be draining when start() runs
+     * (cleanup cancels but does not join it); a shared instance let that stale
+     * feed race the new run's scan offsets / one-shot guard. A new instance per
+     * run isolates each boot. Mirrors the AVF backend, which already does this.
+     */
+    private fun newBootStageDetector() = BootStageDetector(_bootStage, _state) {
         // BootStageDetector has already flipped _state to Running by the time
         // this onReady fires; stamp the uptime origin to match.
         _runningSinceMs = System.currentTimeMillis()
@@ -210,10 +217,19 @@ class QemuEngine @Inject constructor(
     override fun createTerminalSession(client: TerminalSessionClient): TerminalSession {
         sessionClientDelegate = client
 
-        // Session already auto-started during boot — just return it
-        if (_terminalSession != null) {
+        // Reuse the boot-time session ONLY if it's still alive. A finished
+        // session (bridge died while the VM kept running) must not be handed
+        // back — re-entering the terminal screen would otherwise show the dead
+        // "[Process completed]" buffer forever. Drop it and fall through to
+        // spawn a fresh bridge against the still-running VM.
+        val cached = _terminalSession
+        if (cached != null && cached.isRunning) {
             Log.d(TAG, "Returning pre-started terminal session")
-            return _terminalSession!!
+            return cached
+        }
+        if (cached != null) {
+            Log.d(TAG, "Cached terminal session is dead — recreating against the running VM")
+            _terminalSession = null
         }
 
         // Fallback: create session now
@@ -264,14 +280,22 @@ class QemuEngine @Inject constructor(
             return
         }
 
-        ensureStorageImage(config.storageSizeGb)
+        try {
+            ensureStorageImage(config.storageSizeGb)
+        } catch (e: java.io.IOException) {
+            // Restore the "cleanedUp=false ⟺ VM lifetime in progress" invariant
+            // (same as the qemuExecutable() path); no process/scope exists yet.
+            cleanedUp.set(true)
+            bootStartTime = 0L
+            _state.value = VmState.Error(e.message ?: "Could not prepare the VM disk image.")
+            return
+        }
 
         _consoleText.value = ""
         _bootStage.value = "Starting QEMU..."
-        // Re-arm the one-shot detector so a Stop → Start cycle's second boot
-        // can fire onReady again. Without this the new boot's "Ready!" marker
-        // is silently ignored and state stays Starting forever.
-        bootStageDetector.reset()
+        // Fresh per-run detector so a previous run's still-draining monitor can't
+        // feed (or race the one-shot guard / scan offsets of) this run's detector.
+        val detector = newBootStageDetector()
 
         // Clean up stale sockets from a previous run. qmp.sock must be
         // included — a leftover file from a crashed QEMU prevents the new
@@ -289,6 +313,12 @@ class QemuEngine @Inject constructor(
             val nativeDir = context.applicationInfo.nativeLibraryDir
             val pb = ProcessBuilder(cmd).directory(context.filesDir)
             pb.environment()["LD_LIBRARY_PATH"] = "$nativeDir:${context.filesDir.absolutePath}"
+            // Discard QEMU's stdout. Nothing routes there today (serial/QMP use
+            // sockets), but user extra args like `-monitor stdio` could, and an
+            // unread OS pipe would fill its buffer and deadlock the VM. Redirect
+            // to /dev/null rather than merging into stderr, which feeds error
+            // formatting (recordStderr below). Redirect.DISCARD would need API 33.
+            pb.redirectOutput(File("/dev/null"))
 
             // Fork QEMU on a private, long-lived thread (see qemuDispatcher).
             // PR_SET_PDEATHSIG (set by libpodroid-launcher) is thread-scoped, so
@@ -326,7 +356,7 @@ class QemuEngine @Inject constructor(
             // streams the guest console into console.log + the boot-stage detector.
             val monitor = QemuBootMonitor(
                 serialSockPath, File(context.filesDir, "console.log"),
-                bootStageDetector, _consoleText, SOCKET_READY_TIMEOUT_MS,
+                detector, _consoleText, SOCKET_READY_TIMEOUT_MS,
             )
             bootMonitor = monitor
             monitor.connectAndRun(scope) { proc.isAlive }
@@ -446,15 +476,22 @@ class QemuEngine @Inject constructor(
     override suspend fun addPortForward(rule: PortForwardRule) {
         if (_state.value !is VmState.Running) return
         val qmp = qmpClient ?: return
-        runCatching { qmp.addPortForward(rule.hostPort, rule.guestPort, rule.protocol) }
+        // QmpClient returns Result and never throws, so the failure lives INSIDE
+        // the returned Result — unwrap it. getOrThrow rethrows so EngineHolder
+        // records this rule as not-applied and retries on the next diff (a
+        // host-port-already-bound failure would otherwise be permanently dropped
+        // and silently recorded as live).
+        qmp.addPortForward(rule.hostPort, rule.guestPort, rule.protocol, rule.loopbackOnly)
             .onFailure { Log.w(TAG, "QMP addPortForward failed for $rule", it) }
+            .getOrThrow()
     }
 
     override suspend fun removePortForward(rule: PortForwardRule) {
         if (_state.value !is VmState.Running) return
         val qmp = qmpClient ?: return
-        runCatching { qmp.removePortForward(rule.hostPort, rule.protocol) }
+        qmp.removePortForward(rule.hostPort, rule.protocol, rule.loopbackOnly)
             .onFailure { Log.w(TAG, "QMP removePortForward failed for $rule", it) }
+            .getOrThrow()
     }
 
     @Synchronized
@@ -552,9 +589,14 @@ class QemuEngine @Inject constructor(
         val downloadsDir = android.os.Environment.getExternalStoragePublicDirectory(
             android.os.Environment.DIRECTORY_DOWNLOADS
         )
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R &&
-            config.storageAccessEnabled &&
-            android.os.Environment.isExternalStorageManager() &&
+        val hasStorageAccess = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R)
+            android.os.Environment.isExternalStorageManager()
+        else
+            androidx.core.content.ContextCompat.checkSelfPermission(
+                context, android.Manifest.permission.WRITE_EXTERNAL_STORAGE
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (config.storageAccessEnabled &&
+            hasStorageAccess &&
             downloadsDir.exists()) {
             // security_model=mapped-xattr keeps QEMU's 9p worker out of the
             // chmod/chown syscall path that has triggered SIGILL on Tensor /
@@ -570,7 +612,11 @@ class QemuEngine @Inject constructor(
         val netdevArg = buildString {
             append("user,id=net0,ipv6=off")
             for (rule in portForwards) {
-                append(",hostfwd=${rule.protocol}::${rule.hostPort}-:${rule.guestPort}")
+                // hostfwd hostaddr: empty = 0.0.0.0 (LAN-reachable, user rules);
+                // 127.0.0.1 for loopbackOnly rules (implicit VNC/audio) so they
+                // aren't exposed to the network.
+                val hostAddr = if (rule.loopbackOnly) "127.0.0.1" else ""
+                append(",hostfwd=${rule.protocol}:$hostAddr:${rule.hostPort}-:${rule.guestPort}")
             }
         }
         args += "-netdev"; args += netdevArg
@@ -626,16 +672,40 @@ class QemuEngine @Inject constructor(
         val desiredBytes = storageSizeGb.toLong() * 1024L * 1024L * 1024L
 
         if (storageFile.exists()) {
-            if (storageFile.length() == desiredBytes) return
-            Log.d(TAG, "storage.img size mismatch — recreating")
-            storageFile.delete()
+            val current = storageFile.length()
+            when {
+                current == desiredBytes -> return
+                // NEVER delete: storage.img is the persistent ext4 overlay (every
+                // apk add, container, user file). Deleting on mismatch could wipe
+                // all guest data if the size ever changes (a corrupted DataStore
+                // falling back to the 2GB default, or a future resize UI). Grow in
+                // place when larger — the guest's first-boot resize2fs claims the
+                // new space; truncating to shrink would corrupt the filesystem.
+                desiredBytes > current -> {
+                    runCatching {
+                        java.io.RandomAccessFile(storageFile, "rw").use { it.setLength(desiredBytes) }
+                    }.onSuccess {
+                        Log.i(TAG, "storage.img grown ${current / (1024 * 1024)}MB → ${storageSizeGb}GB (guest resize2fs on next boot)")
+                    }.onFailure { Log.e(TAG, "Failed to grow storage.img", it) }
+                    return
+                }
+                else -> {
+                    Log.w(TAG, "storage.img (${current / (1024 * 1024)}MB) larger than requested ${storageSizeGb}GB; keeping existing image (shrink would corrupt the filesystem)")
+                    return
+                }
+            }
         }
 
         try {
             java.io.RandomAccessFile(storageFile, "rw").use { it.setLength(desiredBytes) }
             Log.d(TAG, "Created storage.img (${storageSizeGb}GB)")
         } catch (e: Exception) {
+            // Don't swallow: a 0-byte / missing storage.img would otherwise boot
+            // into an opaque early-boot stop. Surface it so start() can report a
+            // clear storage error (mirrors the AVF disk-create path).
             Log.e(TAG, "Failed to create storage.img", e)
+            runCatching { storageFile.delete() }
+            throw java.io.IOException("Couldn't create the ${storageSizeGb} GB VM disk image: ${e.message}", e)
         }
     }
 

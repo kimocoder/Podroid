@@ -212,15 +212,30 @@ static int cli_notify(int argc, char **argv) {
     if (i >= argc) { fprintf(stderr, "usage: podroid-notify [--title T] [--priority low|normal|high] [--id N] BODY\n"); return 2; }
     size_t blen = 0;
     for (int j = i; j < argc; j++) blen += strlen(argv[j]) + 1;
-    char *body = malloc(blen + 1); body[0] = '\0';
+    char *body = malloc(blen + 1);
+    if (!body) { fprintf(stderr, "podroid: out of memory\n"); return 1; }
+    body[0] = '\0';
     for (int j = i; j < argc; j++) { if (j > i) strcat(body, " "); strcat(body, argv[j]); }
 
     char *b64title = title ? b64encode((const unsigned char *)title, strlen(title)) : NULL;
     char *b64body = b64encode((const unsigned char *)body, strlen(body));
+    /* b64body is required; a NULL (allocation failure) must not reach snprintf's
+     * %s. The title is optional and already falls back to the "-" sentinel. */
+    if (!b64body) {
+        fprintf(stderr, "podroid: out of memory\n");
+        free(body); free(b64title);
+        return 1;
+    }
     char req[8192];
-    snprintf(req, sizeof(req), "NOTIFY %s %s %s %s",
+    int reqlen = snprintf(req, sizeof(req), "NOTIFY %s %s %s %s",
              prio, id, b64title ? b64title : "-", b64body);
     free(body); free(b64title); free(b64body);
+    /* A body over ~6 KB truncates the base64 mid-string, which the host decodes
+     * as a confusing "bad body". Report a clear error instead. */
+    if (reqlen < 0 || (size_t)reqlen >= sizeof(req)) {
+        fprintf(stderr, "podroid: notification body too long\n");
+        return 2;
+    }
 
     char resp[8192];
     if (cli_roundtrip(req, resp, sizeof(resp)) < 0) {
@@ -325,7 +340,11 @@ static int make_unix_listener(void) {
     sa.sun_family = AF_UNIX;
     strncpy(sa.sun_path, SOCK_PATH, sizeof(sa.sun_path) - 1);
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { close(fd); return -1; }
-    chmod(SOCK_PATH, 0666);
+    /* 0660, not 0666: the socket exposes powerful verbs (POWER stop/restart,
+     * HEADLESS, NOTIFY, OPEN). The daemon and the podroid-* CLIs run as root in
+     * the guest, so owner/group rw is sufficient; world-writable let any guest
+     * UID (incl. processes in containers that bind-mount /run) drive them. */
+    chmod(SOCK_PATH, 0660);
     if (listen(fd, 16) < 0) { close(fd); return -1; }
     return fd;
 }
@@ -360,7 +379,11 @@ static int daemon_main(void) {
         if (cli < 0) { if (errno == EINTR) continue; break; }
 
         char req[8192];
-        int rn = read_line(cli, req, sizeof(req));
+        /* Bound the CLI read: a guest process that connects but never sends a
+         * newline would otherwise wedge this single-threaded loop forever and
+         * hang every other podroid-* call. The host channel below already uses
+         * the same timeout; the CLI side must too. */
+        int rn = read_line_timeout(cli, req, sizeof(req), HOST_TIMEOUT_S);
         if (rn <= 0) { close(cli); continue; }
 
         if (host_fd < 0) {
