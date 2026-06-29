@@ -165,19 +165,22 @@ class ZrleDecoder {
                 // Plain RLE: sequence of runs until tile is full.
                 val total = tw * th
                 var filled = 0
+                var currCol = 0
+                var rowBase = ty * stride + tx
                 while (filled < total) {
                     val color = zi.readCpixel()
                     var runLen = zi.readRunLength()
                     if (filled + runLen > total) throw IOException("ZRLE: plain RLE run overruns tile ($filled+$runLen > $total)")
-                    var currRow = filled / tw
-                    var currCol = filled % tw
                     filled += runLen
                     while (runLen > 0) {
                         val n = minOf(runLen, tw - currCol)
-                        java.util.Arrays.fill(target, (ty + currRow) * stride + tx + currCol, (ty + currRow) * stride + tx + currCol + n, color)
+                        java.util.Arrays.fill(target, rowBase + currCol, rowBase + currCol + n, color)
                         runLen -= n
-                        currRow++
-                        currCol = 0
+                        currCol += n
+                        if (currCol == tw) {
+                            currCol = 0
+                            rowBase += stride
+                        }
                     }
                 }
             }
@@ -187,13 +190,20 @@ class ZrleDecoder {
                 val palette = IntArray(n) { zi.readCpixel() }
                 val total = tw * th
                 var filled = 0
+                var currCol = 0
+                var rowBase = ty * stride + tx
                 while (filled < total) {
                     val indexByte = zi.readByte()
                     if (indexByte and 0x80 == 0) {
                         // Single pixel.
                         if (indexByte >= n) throw IOException("ZRLE: palette RLE index $indexByte >= $n")
-                        target[(ty + filled / tw) * stride + (tx + filled % tw)] = palette[indexByte]
+                        target[rowBase + currCol] = palette[indexByte]
                         filled++
+                        currCol++
+                        if (currCol == tw) {
+                            currCol = 0
+                            rowBase += stride
+                        }
                     } else {
                         // Run of palette[index & 0x7F].
                         val idx = indexByte and 0x7F
@@ -201,15 +211,16 @@ class ZrleDecoder {
                         val color = palette[idx]
                         var runLen = zi.readRunLength()
                         if (filled + runLen > total) throw IOException("ZRLE: palette RLE run overruns tile ($filled+$runLen > $total)")
-                        var currRow = filled / tw
-                        var currCol = filled % tw
                         filled += runLen
                         while (runLen > 0) {
                             val chunk = minOf(runLen, tw - currCol)
-                            java.util.Arrays.fill(target, (ty + currRow) * stride + tx + currCol, (ty + currRow) * stride + tx + currCol + chunk, color)
+                            java.util.Arrays.fill(target, rowBase + currCol, rowBase + currCol + chunk, color)
                             runLen -= chunk
-                            currRow++
-                            currCol = 0
+                            currCol += chunk
+                            if (currCol == tw) {
+                                currCol = 0
+                                rowBase += stride
+                            }
                         }
                     }
                 }
