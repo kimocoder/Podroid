@@ -102,30 +102,34 @@ class ZrleDecoder {
             var tx = 0
             while (tx < w) {
                 val tw = minOf(64, w - tx)
-                decodeTile(zi, x + tx, y + ty, tw, th, target, stride)
+                val tileRowBase = (y + ty) * stride + (x + tx)
+                decodeTile(zi, tileRowBase, tw, th, target, stride)
                 tx += 64
             }
             ty += 64
         }
     }
 
-    private fun decodeTile(zi: ZInput, tx: Int, ty: Int, tw: Int, th: Int, target: IntArray, stride: Int) {
+    private fun decodeTile(zi: ZInput, tileRowBase: Int, tw: Int, th: Int, target: IntArray, stride: Int) {
         val subenc = zi.readByte()
         when {
             subenc == 0 -> {
                 // Raw: tw*th CPIXELs.
+                var rowBase = tileRowBase
                 for (row in 0 until th) {
-                    val base = (ty + row) * stride + tx
                     for (col in 0 until tw) {
-                        target[base + col] = zi.readCpixel()
+                        target[rowBase + col] = zi.readCpixel()
                     }
+                    rowBase += stride
                 }
             }
             subenc == 1 -> {
                 // Solid: 1 CPIXEL, fill the whole tile.
                 val color = zi.readCpixel()
+                var rowBase = tileRowBase
                 for (row in 0 until th) {
-                    java.util.Arrays.fill(target, (ty + row) * stride + tx, (ty + row) * stride + tx + tw, color)
+                    java.util.Arrays.fill(target, rowBase, rowBase + tw, color)
+                    rowBase += stride
                 }
             }
             subenc in 2..16 -> {
@@ -137,8 +141,8 @@ class ZrleDecoder {
                     n <= 4 -> 2
                     else -> 4
                 }
+                var rowBase = tileRowBase
                 for (row in 0 until th) {
-                    val base = (ty + row) * stride + tx
                     // Each row is bit-packed, byte-aligned.
                     var col = 0
                     var accumByte = 0
@@ -154,9 +158,10 @@ class ZrleDecoder {
                         // bitsPerIndex rounds up, so the index space can exceed n
                         // when n is not a power of two.
                         if (idx >= n) throw IOException("ZRLE: packed palette index $idx >= $n")
-                        target[base + col] = palette[idx]
+                        target[rowBase + col] = palette[idx]
                         col++
                     }
+                    rowBase += stride
                     // Discard any padding bits at end of row (bitsInAccum may be > 0 but
                     // we already read the full byte; nothing extra to consume).
                 }
@@ -165,19 +170,22 @@ class ZrleDecoder {
                 // Plain RLE: sequence of runs until tile is full.
                 val total = tw * th
                 var filled = 0
+                var currCol = 0
+                var rowBase = tileRowBase
                 while (filled < total) {
                     val color = zi.readCpixel()
                     var runLen = zi.readRunLength()
                     if (filled + runLen > total) throw IOException("ZRLE: plain RLE run overruns tile ($filled+$runLen > $total)")
-                    var currRow = filled / tw
-                    var currCol = filled % tw
                     filled += runLen
                     while (runLen > 0) {
                         val n = minOf(runLen, tw - currCol)
-                        java.util.Arrays.fill(target, (ty + currRow) * stride + tx + currCol, (ty + currRow) * stride + tx + currCol + n, color)
+                        java.util.Arrays.fill(target, rowBase + currCol, rowBase + currCol + n, color)
                         runLen -= n
-                        currRow++
-                        currCol = 0
+                        currCol += n
+                        if (currCol == tw) {
+                            rowBase += stride
+                            currCol = 0
+                        }
                     }
                 }
             }
@@ -187,13 +195,20 @@ class ZrleDecoder {
                 val palette = IntArray(n) { zi.readCpixel() }
                 val total = tw * th
                 var filled = 0
+                var currCol = 0
+                var rowBase = tileRowBase
                 while (filled < total) {
                     val indexByte = zi.readByte()
                     if (indexByte and 0x80 == 0) {
                         // Single pixel.
                         if (indexByte >= n) throw IOException("ZRLE: palette RLE index $indexByte >= $n")
-                        target[(ty + filled / tw) * stride + (tx + filled % tw)] = palette[indexByte]
+                        target[rowBase + currCol] = palette[indexByte]
                         filled++
+                        currCol++
+                        if (currCol == tw) {
+                            rowBase += stride
+                            currCol = 0
+                        }
                     } else {
                         // Run of palette[index & 0x7F].
                         val idx = indexByte and 0x7F
@@ -201,15 +216,16 @@ class ZrleDecoder {
                         val color = palette[idx]
                         var runLen = zi.readRunLength()
                         if (filled + runLen > total) throw IOException("ZRLE: palette RLE run overruns tile ($filled+$runLen > $total)")
-                        var currRow = filled / tw
-                        var currCol = filled % tw
                         filled += runLen
                         while (runLen > 0) {
                             val chunk = minOf(runLen, tw - currCol)
-                            java.util.Arrays.fill(target, (ty + currRow) * stride + tx + currCol, (ty + currRow) * stride + tx + currCol + chunk, color)
+                            java.util.Arrays.fill(target, rowBase + currCol, rowBase + currCol + chunk, color)
                             runLen -= chunk
-                            currRow++
-                            currCol = 0
+                            currCol += chunk
+                            if (currCol == tw) {
+                                rowBase += stride
+                                currCol = 0
+                            }
                         }
                     }
                 }
