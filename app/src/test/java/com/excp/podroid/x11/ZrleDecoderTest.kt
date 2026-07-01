@@ -166,4 +166,48 @@ class ZrleDecoderTest {
         val din = DataInputStream(ByteArrayInputStream(zrleRect(plain.toByteArray())))
         ZrleDecoder().decode(din, 0, 0, 2, 2, IntArray(4), 2)
     }
+
+    @Test
+    fun `plain RLE multi-row run decodes correctly`() {
+        // 4x4 tile, one run of 6 pixels (spans row 0 and part of row 1)
+        val blue = 0xFF0000FF.toInt()
+        val green = 0xFF00FF00.toInt()
+        val plain = java.io.ByteArrayOutputStream()
+        plain.write(128) // plain RLE
+        plain.write(cpixel(blue))
+        plain.write(0x05) // run-length 6
+        plain.write(cpixel(green))
+        plain.write(0x09) // run-length 10 (rest of the 4x4 tile)
+
+        val din = DataInputStream(ByteArrayInputStream(zrleRect(plain.toByteArray())))
+        val target = IntArray(4 * 4)
+        ZrleDecoder().decode(din, 0, 0, 4, 4, target, 4)
+
+        for (i in 0 until 6) assertEquals("Pixel $i should be blue", blue, target[i])
+        for (i in 6 until 16) assertEquals("Pixel $i should be green", green, target[i])
+    }
+
+    @Test
+    fun `palette RLE multi-row run decodes correctly`() {
+        // 4x4 tile, palette of 2 colors
+        val blue = 0xFF0000FF.toInt()
+        val green = 0xFF00FF00.toInt()
+        val plain = java.io.ByteArrayOutputStream()
+        plain.write(130) // palette RLE, n=2
+        plain.write(cpixel(blue))
+        plain.write(cpixel(green))
+        // Run of palette[0] (blue), length 6
+        plain.write(0x80 or 0)
+        plain.write(0x05)
+        // Run of palette[1] (green), length 10
+        plain.write(0x80 or 1)
+        plain.write(0x09)
+
+        val din = DataInputStream(ByteArrayInputStream(zrleRect(plain.toByteArray())))
+        val target = IntArray(4 * 4)
+        ZrleDecoder().decode(din, 0, 0, 4, 4, target, 4)
+
+        for (i in 0 until 6) assertEquals("Pixel $i should be blue", blue, target[i])
+        for (i in 6 until 16) assertEquals("Pixel $i should be green", green, target[i])
+    }
 }
