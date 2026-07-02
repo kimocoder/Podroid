@@ -189,16 +189,19 @@ object VncClient {
                     requireInBounds(x, y, w, h, stride, targetArgb.size)
                     val needed = w * 4
                     val rowPixels = rowBuf?.takeIf { it.size >= needed } ?: ByteArray(needed).also { rowBuf = it }
+                    // Optimization: replace row index multiplication with incremental rowBase.
+                    var rowBase = y * stride + x
                     for (row in 0 until h) {
                         din.readFully(rowPixels, 0, needed)
-                        var off = 0; val base = (y + row) * stride + x
+                        var off = 0
                         for (col in 0 until w) {
                             val b = rowPixels[off].toInt() and 0xFF
                             val g = rowPixels[off + 1].toInt() and 0xFF
                             val r = rowPixels[off + 2].toInt() and 0xFF
-                            targetArgb[base + col] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                            targetArgb[rowBase + col] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
                             off += 4
                         }
+                        rowBase += stride
                     }
                     damage.add(VncRect(x, y, w, h))
                 }
@@ -206,8 +209,24 @@ object VncClient {
                     val srcX = din.readUnsignedShort(); val srcY = din.readUnsignedShort()
                     requireInBounds(x, y, w, h, stride, targetArgb.size)
                     requireInBounds(srcX, srcY, w, h, stride, targetArgb.size)
-                    if (srcY < y) for (row in h - 1 downTo 0) System.arraycopy(targetArgb, (srcY + row) * stride + srcX, targetArgb, (y + row) * stride + x, w)
-                    else for (row in 0 until h) System.arraycopy(targetArgb, (srcY + row) * stride + srcX, targetArgb, (y + row) * stride + x, w)
+                    // Optimization: replace row index multiplication with incremental rowBase.
+                    var rowBase = y * stride + x
+                    var srcRowBase = srcY * stride + srcX
+                    if (srcY < y) {
+                        rowBase += (h - 1) * stride
+                        srcRowBase += (h - 1) * stride
+                        for (row in h - 1 downTo 0) {
+                            System.arraycopy(targetArgb, srcRowBase, targetArgb, rowBase, w)
+                            rowBase -= stride
+                            srcRowBase -= stride
+                        }
+                    } else {
+                        for (row in 0 until h) {
+                            System.arraycopy(targetArgb, srcRowBase, targetArgb, rowBase, w)
+                            rowBase += stride
+                            srcRowBase += stride
+                        }
+                    }
                     damage.add(VncRect(x, y, w, h))
                 }
                 ENC_ZRLE -> {
