@@ -154,6 +154,45 @@ class ZrleDecoderTest {
         )
     }
 
+    @Test fun `plain RLE multi-row run decodes correctly`() {
+        val color = 0xFF123456.toInt()
+        val otherColor = 0xFF654321.toInt()
+        val plain = java.io.ByteArrayOutputStream()
+        plain.write(128) // plain RLE
+        plain.write(cpixel(color))
+        plain.write(0x09) // run length 10 (sum 9 + 1)
+        plain.write(cpixel(otherColor))
+        plain.write(0x05) // run length 6 (sum 5 + 1)
+
+        val din = DataInputStream(ByteArrayInputStream(zrleRect(plain.toByteArray())))
+        val target = IntArray(4 * 4)
+        ZrleDecoder().decode(din, 0, 0, 4, 4, target, 4)
+
+        for (i in 0 until 10) assertEquals("Pixel $i", color, target[i])
+        for (i in 10 until 16) assertEquals("Pixel $i", otherColor, target[i])
+    }
+
+    @Test fun `palette RLE multi-row run decodes correctly`() {
+        val c0 = 0xFF111111.toInt()
+        val c1 = 0xFF222222.toInt()
+        val plain = java.io.ByteArrayOutputStream()
+        plain.write(130) // palette RLE, n=2
+        plain.write(cpixel(c0)); plain.write(cpixel(c1))
+
+        // Run of palette[1] for 10 pixels: bit7=1, index=1 -> 0x81
+        plain.write(0x81)
+        plain.write(0x09) // run length 10
+        // Single pixel of palette[0] for 6 pixels: bit7=0, index=0 -> 0x00
+        repeat(6) { plain.write(0x00) }
+
+        val din = DataInputStream(ByteArrayInputStream(zrleRect(plain.toByteArray())))
+        val target = IntArray(4 * 4)
+        ZrleDecoder().decode(din, 0, 0, 4, 4, target, 4)
+
+        for (i in 0 until 10) assertEquals("Pixel $i", c1, target[i])
+        for (i in 10 until 16) assertEquals("Pixel $i", c0, target[i])
+    }
+
     /** High: a palette-RLE single-pixel index beyond the palette → IOException, not AIOOBE. */
     @Test(expected = java.io.IOException::class)
     fun `palette RLE index out of range throws IOException`() {
